@@ -104,3 +104,23 @@ SSH 入口见 [SSH 指南](PWA-SSH-Tunnel.md)，Tailscale 入口见 [Tailscale �
 ## M20 退役升级
 
 新 unit 使用 `scripts/runtime/watchdog.py --once`；旧 `scripts/poller/watchdog.py --once --agent` 保留兼容。发布事务只备份、删除五个固定旧 Python 代码路径，回退恢复其原始字节，运行数据不回退。旧 unit 的禁用/屏蔽、私人 drop-in 核对和维护窗口步骤见 [M20](M20-retire-legacy-poller.md)。只启用同一个看护 timer。
+
+## M21 项目仓库入口
+
+目标：[kiyasu-desu/sve-event-helper](https://github.com/kiyasu-desu/sve-event-helper)，2026-11-08 通过 GitHub 元数据确认其规范 HTTPS 地址及私有状态。侧栏仍在左下角，采用原 GitHub 图标、当前窗口跳转与私有仓库访问提示；链接不含凭据。无权限时由 GitHub 处理登录或访问拒绝。
+
+开发基线为已合并 M20 的 `d5dba08`。新仓库独立脱敏初始导入已将源码链接切换到新目标和 v25，但未部署到生产；M21 明确发布来源并将 SW 升至 `sve-v26-m21-repository-link`。不能将源码正确当作生产页面已经更新。
+
+唯一的项目入口发布来源是受跟踪的 `app/client/ui/index.html` 中 `meta[name="sve-repository"]`。它属于 M17 已授权公开展示的项目元数据；本项目发布保存核实后的实际仓库地址，通用示例和测试 URL 继续使用 `https://github.com/example/sve-monitor`。制作通用模板时使用示例 URL，供应具体项目时在独立提交中更新此 meta、权限提示及 SW 版本，不从开发机 origin 自动猜测，也不注入认证凭据。
+
+`release.py build --ref <完整SHA>` 直接从指定提交导出 HTML 与 sw.js；`release.json` 对二者记录精确哈希及源码 SHA。不在打包后或服务器上手改页面：这会使校验失效。重新构建同一提交得到同一链接，升级按清单切换，回退恢复原 HTML 和 SW，包括原链接配置。部署文档同在既有发布白名单中，无需增改清单协议。
+
+生产切换另行授权，执行前只读核对实际运行发布和页面，按正常停写升级/回退流程保护数据。升级后核对 `/`、`/subs`、`/settings` 返回 HTML 中的 meta，确认与上述目标完全一致；在浏览器 DOM 再核对 `#projectGithub.href`，页面 meta 和最终按钮都必须为新地址。代理内检查不能替代认证后公网检查。
+
+PWA 导航保留网络优先策略，v26 激活后移除旧版本缓存并接管页面；离线时仍可能看到更新前已经缓存的壳，须联网取得新 SW 和页面后再验收。无需清除全部站点数据或登录状态。Android 继续使用现有入口加载服务端页面，无需重装 APK；不改变 HTTPS、Cloudflare Access、隧道或登录协议。
+
+手机浏览器、已安装 PWA 和 Android 应用分别检查：联网打开三个业务/设置入口，展开侧栏确认 GitHub 位置及 href，点击后进入新仓库，使用系统返回回到应用；前后台恢复后仍为新链接。有权限账户应能查看仓库，无权限账户应看到 GitHub 的登录/访问限制。测试不附带 token 或 Cookie。
+
+本次源码交付不部署服务器、不变更开发 origin。使用既有 event-helper remote 推送，保留旧 origin 供本地追溯；禁止从旧仓库导入历史。本地模拟页面/PWA 与隔离发布验证不代表生产公网、GitHub 权限切换或手机真机已经验收。
+
+M21 本地验证（2026-11-08）：前端隔离回归 93 项通过，包含从实际 HTML meta 初始化三个页面/带前缀路由的按钮及新 SW 淘汰 v25 缓存；3 项隔离发布回归通过，覆盖三个页面返回原始发布壳、指定提交构建及原发布清单精确回退。完整候选树使用私人标识表扫描零命中。生产页面和手机/PWA/Android 跳转及返回未实测。
