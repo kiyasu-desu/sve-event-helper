@@ -142,8 +142,8 @@ generateSign = function (data, extra, o) {
 
 **list 接口的签名要带 query 参数**（detail 用空 body 即可；list 不带 query 会 403）。
 
-实现：`app/client/core/sveapi.py`（客户端侧）与 `scripts/poller/signer.py`（脚本侧）。
-`signer.py` 自带拼接规则自检（`python scripts/poller/signer.py`，与密钥无关，
+实现：`app/client/core/sveapi.py`（客户端侧）与 `scripts/probe/signer.py`（脚本侧）。
+`signer.py` 自带拼接规则自检（`python scripts/probe/signer.py`，与密钥无关，
 换任何 appKey 都能跑）。
 
 ### appKey 的配置
@@ -268,7 +268,7 @@ $py = '.\vendor\venv314\Scripts\python.exe'
 & .\scripts\selfcheck.ps1                   # 全量：路径/语法/运行状态/设备
 
 # —— 单项排查 ——
-& $py scripts\poller\signer.py              # 签名拼接规则自检（与密钥无关）
+& $py scripts\probe\signer.py              # 签名拼接规则自检（与密钥无关）
 & $py -B deploy/diagnostics.py              # 只读部署检查，不调用官方接口
 Get-Content capture\poll.log -Tail 20       # 轮询日志
 ```
@@ -401,37 +401,14 @@ sve-monitor/
 
 ---
 
-## 12. 附：旧轮询器（已退役，保留仅供参考）
+## 12. 附：旧轮询器退役
 
-`scripts/poller/` 下的 `poll.py` / `autosignup.py` / `watchdog.ps1` 是**项目早期形态**：
-针对单一场赛事的「名额监控 + 自动报名」。
-
-| | 旧轮询器 `sve-poller` | 现方案 `sve-agent` |
-|---|---|---|
-| 账号 | **单账号** | **多账号**，各自独立订阅 |
-| 赛事 | 单赛事（配置写死） | **订阅体系**，任意赛事、可随时增删 |
-| 界面 | 无（只有日志与通知） | **Web 界面** |
-| 会话 | `capture/session.json` | `identity-v2.json`（单一来源） |
-| 启停 | `poller_ctl.ps1` / systemd | systemd `sve-agent` |
-
-**它仍可运行**，但：
-
-- **不要与 `sve-agent` 同时跑**——会重复提交报名（`deploy/verify.sh` 会断言）；
-- 它的 `capture/session.json` 已删除，需要用 `session_manager.py --export` 或
-  从 `identity-v2.json` 按 account_id 只读提供会话；
-- 它的 `config/settings.json` 参数（`interval_seconds`、`active_start/end`、
-  `auto_signup` 等）**只对它自己有效**，代理用的是 §2 的分档参数。
-
-保留它的价值在于：**它的看护脚本与时段判定回归测试仍然可用**，
-且 `signer.py` / `notify.py` / `session_manager.py` 是**代理也在复用**的模块。
-
-```powershell
-# 旧轮询器的启停（仅在明确需要时使用）
-& .\scripts\poller\poller_ctl.ps1 -Start
-& .\scripts\poller\poller_ctl.ps1 -Status
-& .\scripts\poller\poller_ctl.ps1 -Stop
-```
+早期单账号单赛事执行链已无条件封锁，不再提供启动、直连报名或会话恢复操作。旧实现仅用于 Git 历史追溯；现役通知、看护与开发签名工具已经迁出该目录。兼容范围、代码包清理和独立生产 unit 维护见 [M20](deploy/M20-retire-legacy-poller.md)。
 
 ## 外部运行目录（M05）
 
 服务器可将运行数据、settings、日志和发布备份迁出代码目录。已有部署先阅读 [M05 迁移与回退](deploy/M05-external-runtime.md)，在停写维护窗口用离线工具迁移，再配置受保护的 EnvironmentFile；仅设置 SVE_DATA_DIR 不会自动搬走旧文件。地区数据继续随代码发布，现有手机入口和登录协议保持兼容。
+
+## M20 旧执行链退役
+
+自动报名由 UID 服务订阅调度器执行。通知使用 `app/client/core/notification_sender.py`，代理看护使用 `scripts/runtime/watchdog.py --once`。历史轮询、直连报名、会话恢复及 Windows 轮询控制器已封锁。旧 `scripts/poller/watchdog.py --once --agent` 暂时转发到同一现役模块、状态与写锁。新包排除旧执行器与开发签名工具；部署及回退见 [M20](deploy/M20-retire-legacy-poller.md)。

@@ -26,7 +26,7 @@ import sys
 # appKey 不随仓库分发：从环境变量 SVE_APP_KEY 或 config/settings.json 读取。
 # （这两个脚本原先硬编码了密钥，等于把它写进了仓库。）
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "poller"))
+sys.path.insert(0, _HERE)
 from signer import load_app_key  # noqa: E402
 from private_samples import load_sample
 

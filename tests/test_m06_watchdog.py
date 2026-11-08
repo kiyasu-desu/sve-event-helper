@@ -217,8 +217,8 @@ class RuntimeTests(unittest.TestCase):
             self.addCleanup(guard.assert_not_called)
         import watchdog
         self.watchdog = watchdog
-        self.guards.enter_context(patch.object(watchdog.P, "SETTINGS", str(self.data / "settings.json")))
-        self.guards.enter_context(patch.object(watchdog.P.sveenv, "DATA_DIR", str(self.data)))
+        self.guards.enter_context(patch.object(watchdog, "SETTINGS", str(self.data / "settings.json")))
+        self.guards.enter_context(patch.object(watchdog, "DATA_DIR", str(self.data)))
         self.guards.enter_context(patch.object(watchdog, "WATCHDOG_LOG", str(self.data / "watchdog.log")))
         spec = importlib.util.spec_from_file_location("sve_m06_test", ROOT / "app/client/server.py")
         self.server = importlib.util.module_from_spec(spec)

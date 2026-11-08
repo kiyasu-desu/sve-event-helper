@@ -259,7 +259,7 @@ class AccountProtectionTests(unittest.TestCase):
         self.assertTrue(self.post("/api/notify/config", {"channels": config})["ok"])
         sender = Mock()
         sender.notify_all.return_value = [("email", False, self.mail_value + " recipient@example.com")]
-        with patch.dict(sys.modules, {"notify": sender}):
+        with patch.dict(sys.modules, {"notification_sender": sender}):
             result = self.post("/api/notify/test", {})
             self.assertEqual(self.mail_value, sender.notify_all.call_args.args[0]["email"]["authcode"])
             self.assertNotIn(self.mail_value, json.dumps(result))

@@ -34,7 +34,7 @@ SKIP_IMPORT = {
     "probe_device.js",
 }
 
-SKIP_IMPORT_DIRS = ("recon", "probe")
+SKIP_IMPORT_DIRS = ("recon", "probe", "poller")
 
 # 测试类模块也不要"导入验证"：它们模块级就跑完整场景（有副作用），
 # 曾被 check_scripts 间接执行、把测试日志写进生产 poll.log，看起来
@@ -46,9 +46,7 @@ SKIP_IMPORT_PREFIX = ("test_",)
 #   - 不要把 check_scripts.py 自己列进来（会递归调用自己直到超时）
 #   - sve_capture.py 属于已废弃的 HTTP 代理方案，依赖 mitmproxy，不在必需范围
 CLI_HELP = {
-    "poll.py", "action.py", "session_manager.py", "signer.py",
     "netcap_run.py", "audit_paths.py", "list_sign.py",
-    "test_autosignup_spin.py", "test_autosignup_confirm.py",
 }
 
 

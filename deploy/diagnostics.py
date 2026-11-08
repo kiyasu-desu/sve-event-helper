@@ -88,8 +88,8 @@ def notify_test(root, data_dir):
     spec = importlib.util.spec_from_file_location("sve_notify_diagnostic", Path(root) / "app/client/server.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    sys.path.insert(0, str(Path(root) / "scripts/poller"))
-    import notify
+    sys.path.insert(0, str(Path(root) / "app/client/core"))
+    import notification_sender as notify
     results = notify.notify_all(module.notify_channels(), "SVE explicit notification test", "<p>Explicit operator notification test</p>")
     return {"ok": any(ok for _, ok, _ in results), "operation": "notification_test",
             "channels": [{"channel": name, "accepted": bool(ok)} for name, ok, _ in results]}

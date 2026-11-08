@@ -1,48 +1,8 @@
 [Unit]
-Description=SVE 旧轮询器（已退役；单赛事单账号，保留仅供参考）
-Documentation=file://__APP_DIR__/deploy/README.md
-After=network-online.target
-Wants=network-online.target
+Description=Retired SVE poller; do not enable
 
 [Service]
-Type=simple
-User=__SVE_USER__
-Group=__SVE_USER__
-WorkingDirectory=__APP_DIR__
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONIOENCODING=utf-8
-# 显式锁定时区：所有报名时段判断（如 16:00~23:59）都基于本地时间。
-# 云服务器默认常是 UTC（实测 Azure Ubuntu 就是 Etc/UTC），若不指定，
-# 会在北京时间 24:00 而不是 16:00 开始轮询——直接错过当天窗口。
-# 写在这里而不是依赖宿主机配置，是为了让服务行为可预测、可迁移。
-Environment=TZ=Asia/Shanghai
-
-# 轮询器自己处理"是否在报名时段"，非时段内会休眠，因此常驻即可。
-ExecStart=__APP_DIR__/.venv/bin/python -u scripts/poller/poll.py
-
-# 退出码 4 = 单实例锁拒绝（已有实例在跑）。若设成 always 会变成死循环重启，
-# 所以用 on-failure 并显式排除 4。
-Restart=on-failure
-RestartSec=15
-RestartPreventExitStatus=4
-
-# 任务完成时 poll.py 会正常退出（exit 0），此时**不应**重启：
-# 重启后它会读完成标记、只做一次只读校验再退出，白白发请求。
-# on-failure 天然满足这一点。
-
-StandardOutput=append:__APP_DIR__/capture/poller_stdout.log
-StandardError=append:__APP_DIR__/capture/poller_stdout.log
-
-# 轻微加固：该服务只需要写自己的目录，不需要任何特权
+Type=oneshot
+ExecStart=/bin/false
+Restart=no
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=read-only
-# 注意路径前的 `-`：表示"不存在就忽略"。
-# 踩过的坑：这里原本写了 vendor/，但 vendor/ 并不会被部署到服务器上，
-# systemd 建立命名空间时因路径不存在直接失败，服务以 226/NAMESPACE 反复重启，
-# 而 systemd-analyze verify 是查不出来的（它只校验语法，不校验路径是否存在）。
-ReadWritePaths=-__APP_DIR__/capture -__APP_DIR__/config
-
-[Install]
-WantedBy=multi-user.target

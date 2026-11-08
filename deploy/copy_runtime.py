@@ -10,20 +10,6 @@ from pathlib import Path
 import shutil
 import tempfile
 
-EXACT_FILES = (
-    "README.md", "app/client/server.py", "app/client/data/areas.json",
-    "app/client/data/README.md", "config/settings.example.json",
-    "app/client/ui/manifest.json",
-    "scripts/sveenv.py", "scripts/identity_migrate.py", "deploy/requirements.txt",
-)
-GLOBS = (
-    "app/client/core/*.py", "app/client/ui/*.html", "app/client/ui/*.js",
-    "app/client/ui/*.css", "app/client/ui/*.png",
-    "scripts/poller/*.py", "deploy/*.sh", "deploy/*.py",
-    "deploy/systemd/*.service", "deploy/systemd/*.timer",
-)
-
-
 def reject_symlinks(path: Path, root: Path) -> None:
     while True:
         if path.is_symlink():
@@ -44,9 +30,12 @@ def copy_runtime(source: Path, target: Path) -> int:
         return 0  # In-place upgrade: no cleanup, no data/config writes.
     reject_symlinks(source, source)
     reject_symlinks(target, target)
-    files = {source / name for name in EXACT_FILES if (source / name).is_file()}
-    for pattern in GLOBS:
-        files.update(p for p in source.glob(pattern) if p.is_file() and not p.name.startswith("test_"))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("sve_copy_release", Path(__file__).with_name("release.py"))
+    release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release)
+    FILES = release.FILES
+    files = {source / name for name in (*FILES, "app/client/data/README.md") if (source / name).is_file()}
     plan = []
     for path in sorted(files):
         reject_symlinks(path, source)

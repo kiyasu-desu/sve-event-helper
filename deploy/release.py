@@ -38,8 +38,18 @@ M05_ADDITIONS = {"app/client/core/runtime_paths.py", "config/secrets.env.example
                  "deploy/runtime_migrate.py", "deploy/M05-external-runtime.md"}
 M06_ADDITIONS = {"app/client/core/notification_config.py", "app/client/core/scheduler_health.py",
                  "app/client/core/watchdog_state.py", "deploy/M06-scheduler-watchdog.md"}
-M05_FILES = set(FILES) - M06_ADDITIONS
+M06_FILES = set(FILES)
+M05_FILES = M06_FILES - M06_ADDITIONS
 LEGACY_FILES = M05_FILES - M05_ADDITIONS
+RETIRED_FILES = tuple("scripts/poller/%s.py" % name for name in
+                      ("poll", "action", "autosignup", "session_manager", "signer"))
+FILES = tuple(name for name in FILES if name not in RETIRED_FILES) + (
+    "app/client/core/notification_sender.py", "scripts/runtime/watchdog.py",
+    "deploy/M20-retire-legacy-poller.md",
+)
+# Only these fixed code paths may be removed/restored. Runtime data is never swept.
+SWITCH_FILES = tuple(dict.fromkeys((*FILES, *RETIRED_FILES)))
+
 
 
 def paths(target, data_dir=None):
@@ -169,7 +179,7 @@ def verify_package(root, installed=False):
             or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_sha", ""))
             or not re.fullmatch(r"sve-[0-9a-f]{12}-[0-9TZ]+", manifest.get("release_id", ""))
             or not isinstance(manifest.get("built_at"), str)
-            or not isinstance(manifest.get("files"), dict) or set(manifest["files"]) not in (set(FILES), M05_FILES, LEGACY_FILES)):
+            or not isinstance(manifest.get("files"), dict) or set(manifest["files"]) not in (set(FILES), M06_FILES, M05_FILES, LEGACY_FILES)):
         raise ValueError("Invalid manifest contract")
     if not manifest["release_id"].startswith("sve-" + manifest["source_sha"][:12] + "-"):
         raise ValueError("Release ID/source mismatch")
@@ -182,6 +192,10 @@ def verify_package(root, installed=False):
             source = data.decode("utf-8-sig")
             ast.parse(source, filename=name, feature_version=(3, 10))
             compile(source, name, "exec")
+    if set(manifest["files"]) == set(FILES):
+        for name in RETIRED_FILES:
+            if safe_path(root, name).exists():
+                raise ValueError("Retired executable remains in current release")
     if not installed:
         actual = set()
         for path in root.rglob("*"):
@@ -265,6 +279,9 @@ with tempfile.TemporaryDirectory(prefix='sve-preflight-') as directory:
  with patch.object(socket.socket,'connect',blocked),patch.object(subprocess,'Popen',blocked),patch.object(threading.Thread,'start',blocked),patch.object(urllib.request,'urlopen',blocked):
   spec=importlib.util.spec_from_file_location('sve_candidate',sys.argv[1]); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
   assert not module.STATE['schedulers']
+  sys.path.insert(0,os.path.join(os.path.dirname(sys.argv[1]),'../../scripts/runtime'))
+  import watchdog,notification_sender
+  assert not any(name in sys.modules for name in ('poll','autosignup','session_manager'))
   # Settings shares the existing packaged shell; older rollback candidates
   # without this panel retain their original route contract.
   with open(os.path.join(os.path.dirname(sys.argv[1]),'ui','index.html'),'rb') as source:
@@ -307,7 +324,7 @@ def apply(package, target, *, writers_stopped=False, python=sys.executable, data
     package, target = Path(package).resolve(), Path(target).absolute()
     if package == target.resolve() or target.resolve().is_relative_to(package) or package.is_relative_to(target.resolve()):
         raise ValueError("Source/target overlap")
-    for name in (*FILES, "release.json", "deployment-state.json"):
+    for name in (*SWITCH_FILES, "release.json", "deployment-state.json"):
         safe_path(target, name)
     data = paths(target, data_dir).data
     if target.resolve().is_relative_to(data.resolve()) or package.is_relative_to(data.resolve()):
@@ -334,7 +351,7 @@ def apply(package, target, *, writers_stopped=False, python=sys.executable, data
                 if not any(isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "SCHEMA" for t in node.targets)
                            and isinstance(node.value, ast.Constant) and node.value.value == 2 for node in tree.body):
                     raise ValueError("Legacy baseline is not schema 2 compatible")
-        for name in (*FILES, "release.json"):
+        for name in (*SWITCH_FILES, "release.json"):
             path = safe_path(target, name)
             if path.exists() and not path.is_file():
                 raise ValueError("Nonregular destination")
@@ -345,7 +362,7 @@ def apply(package, target, *, writers_stopped=False, python=sys.executable, data
         backup = safe_path(paths(target, data).backups, backup_id)
         make_directory(backup, mode=0o700)
         previous = {}
-        for name in (*FILES, "release.json"):
+        for name in (*SWITCH_FILES, "release.json"):
             path = target / name
             if path.exists():
                 content = path.read_bytes()
@@ -366,6 +383,13 @@ def apply(package, target, *, writers_stopped=False, python=sys.executable, data
             write(safe_path(target, name), content)
             if fail_after == "copying" and index == 0:
                 raise OSError("Simulated interruption")
+        for name in RETIRED_FILES:
+            path = safe_path(target, name)
+            if path.exists():
+                path.unlink()
+                sync_directory(path.parent)
+        if fail_after == "retired":
+            raise OSError("Simulated interruption after retirement")
         write(safe_path(target, "release.json"), (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode(), 0o644)
         verify_package(target, installed=True)
         journal["stage"] = "complete"
@@ -375,7 +399,7 @@ def apply(package, target, *, writers_stopped=False, python=sys.executable, data
 
 def verify_restored(target, previous, *, include_entry=False):
     """Check all previous public bytes/absences before releasing the old entry."""
-    for name in (*FILES, "release.json"):
+    for name in (*SWITCH_FILES, "release.json"):
         if name == ENTRY and not include_entry:
             continue
         path = safe_path(target, name)
@@ -399,7 +423,7 @@ def rollback(target, *, writers_stopped=False, data_dir=None, fail_after=None):
     if not writers_stopped:
         raise ValueError("Explicit stopped writers required")
     target = Path(target).absolute()
-    for name in (*FILES, "release.json", "deployment-state.json"):
+    for name in (*SWITCH_FILES, "release.json", "deployment-state.json"):
         safe_path(target, name)
     data = paths(target, data_dir).data
     if target.resolve().is_relative_to(data.resolve()):
@@ -417,7 +441,7 @@ def rollback(target, *, writers_stopped=False, data_dir=None, fail_after=None):
         if value["schema_version"] not in journal.get("compatible_schemas", []):
             raise ValueError("Rollback data incompatible; preserve latest data")
         previous = journal["previous_files"]
-        if not isinstance(previous, dict) or not set(previous) <= set(FILES) | {"release.json"}:
+        if not isinstance(previous, dict) or not set(previous) <= set(SWITCH_FILES) | {"release.json"}:
             raise ValueError("Invalid rollback file list")
         if paths(target, data).external and "app/client/core/runtime_paths.py" not in previous:
             raise ValueError("Reverse runtime relocation before rolling back to pre-M05 code")
@@ -426,7 +450,7 @@ def rollback(target, *, writers_stopped=False, data_dir=None, fail_after=None):
         for name, expected in previous.items():
             if digest(safe_path(backup, "code/" + name).read_bytes()) != expected:
                 raise ValueError("Backup hash mismatch")
-        for name in (*FILES, "release.json"):
+        for name in (*SWITCH_FILES, "release.json"):
             safe_path(target, name)
         if journal.get("stage") == "rolled_back":
             # A crash between committing the restored set and releasing its entry
@@ -444,7 +468,7 @@ def rollback(target, *, writers_stopped=False, data_dir=None, fail_after=None):
         journal["entry_pending"] = True
         journal_save(journal_path, journal)
         write(safe_path(target, ENTRY), ROLLBACK_FENCE)
-        for index, name in enumerate(name for name in (*FILES, "release.json") if name != ENTRY):
+        for index, name in enumerate(name for name in (*SWITCH_FILES, "release.json") if name != ENTRY):
             path = safe_path(target, name)
             if name in previous:
                 write(path, safe_path(backup, "code/" + name).read_bytes())
