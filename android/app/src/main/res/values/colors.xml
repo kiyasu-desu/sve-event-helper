@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 统一色板：与 Web 界面一致 -->
+<resources>
+    <color name="bg">#0f1116</color>
+    <color name="accent">#3b82f6</color>
+    <color name="ic_launcher_background">#0f1116</color>
+</resources>

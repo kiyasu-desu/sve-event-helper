@@ -1,0 +1,13 @@
+[Unit]
+Description=每分钟检查 SVE 调度进度与线程状态
+Documentation=file://__APP_DIR__/deploy/README.md
+
+[Timer]
+# 每分钟检查；每类故障连续两次检查确认，期限额外宽限见 settings.watchdog。
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=sve-watchdog.service
+
+[Install]
+WantedBy=timers.target

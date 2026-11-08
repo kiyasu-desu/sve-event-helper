@@ -1,0 +1,74 @@
+# ===================================================================
+#  .gitignore —— 请在 `git init` **之前**确认本文件已存在
+#
+#  为什么顺序重要：凭据一旦被提交，即使随后删除文件，它仍永久留在
+#  git 历史里（必须重写历史或作废全部凭据才能补救）。
+# ===================================================================
+
+# ------------------------------------------------------------------
+# 凭据 / 运行时数据
+#
+# 这里全部是运行时生成、且含会话凭据或个人数据的文件。
+# 它们可用 SVE_DATA_DIR 环境变量指到仓库外（如 /var/lib/sve），
+# 那样"仓库里没有凭据"就是结构性事实，而不是靠本文件的自觉。
+# ------------------------------------------------------------------
+config/settings.json
+config/secrets.json
+config/private-scan.json
+config/signing-samples.json
+
+app/client/data/*
+# 地区数据（34 省 / 268 市）无隐私，且界面需要它。
+# 注意：它是从 APP bundle 字符串表提取的，而提取源已不再随仓库分发，
+# 所以**不能**用 .gitignore 排除，否则新克隆的界面会缺地区选择。
+!app/client/data/areas.json
+!app/client/data/README.md
+
+# ------------------------------------------------------------------
+# 抓包 / 日志 / 取证材料
+# ------------------------------------------------------------------
+capture/*
+!capture/README.md
+*.log
+*.jsonl
+*.db
+*.flow
+*.pid
+.deployment-backups/
+.maintenance/
+maintenance-backups/
+deployment-state.json
+release.json
+
+# ------------------------------------------------------------------
+# 虚拟环境与缓存
+# ------------------------------------------------------------------
+vendor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pip-*.log
+pip-build-tracker-*/
+pip-install-*/
+pip-unpack-*/
+pip-ephem-wheel-cache-*/
+
+# ------------------------------------------------------------------
+# 编辑器 / 系统
+# ------------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# M05 offline storage journal contains private filesystem locations.
+runtime-migration.json
+secrets.env
+
+# M06 private watchdog incident state.
+watchdog-state.json
+
+# Private deployment helper and nested worktrees must stay local.
+config/sudo-password.txt
+.worktrees/

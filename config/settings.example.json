@@ -1,0 +1,82 @@
+{
+  "_comment": "配置模板：复制为 settings.json 后填入自己的凭证。settings.json 含密钥，已被 .gitignore 排除，不要提交或外发。",
+  "_sections": "本文件分两部分：【A】当前使用中（客户端 + 服务器代理）；【B】旧轮询器（已退役，保留仅供参考）。两者互不影响。",
+
+  "app_key": "<你的 appKey>",
+  "_app_key_note": "签名必需，不随仓库分发。也可用环境变量 SVE_APP_KEY 覆盖（优先级更高）。服务端可用 systemd EnvironmentFile= 注入，见 deploy/README.md。",
+
+  "channels": {
+    "_comment": "通知渠道。可在设置页修改；页面只显示配置状态，输入留空保留原值。环境变量优先级最高。",
+    "pushplus": {
+      "enabled": true,
+      "token": "<PushPlus token，pushplus.plus 微信扫码登录后获取>"
+    },
+    "email": {
+      "enabled": true,
+      "smtp_host": "smtp.qq.com",
+      "smtp_port": 465,
+      "use_ssl": true,
+      "username": "<你的邮箱>",
+      "authcode": "<SMTP 授权码，不是登录密码>",
+      "from_addr": "<你的邮箱>",
+      "to_addrs": [
+        "<收件邮箱>"
+      ]
+    }
+  },
+
+  "_scheduler_tiers_comment": "【A】自动报名代理的分档轮询，以窗口开放时刻 T 为基准（每日窗口型取每天的开放时刻）：",
+  "_scheduler_tiers": "T 前 >40 分 → idle_interval(1800s)；40~6 分 → warm_interval(300s)；6~2 分 → poll_interval(15s)；T 前后各 2 分 → hot_interval(0.8s)；T 后 2 分起(窗口内) → poll_interval(15s)",
+  "idle_interval": 1800,
+  "warm_window_seconds": 2400,
+  "warm_interval": 300,
+  "near_window_seconds": 360,
+  "poll_interval": 15,
+  "hot_window_seconds": 120,
+  "hot_interval": 0.8,
+  "second_confirm_delay": 60,
+  "profile_refresh_interval_seconds": 600,
+  "watchdog": {
+    "_comment": "M06：连续两次检查确认；阶段期限额外宽限 30 秒，上游持续失败单独分类。通知失败指数退避，不自动重启服务。",
+    "confirm_checks": 2,
+    "min_check_seconds": 30,
+    "grace_seconds": 30,
+    "upstream_failures": 3,
+    "upstream_seconds": 180,
+    "retry_seconds": 60,
+    "max_retry_seconds": 3600
+  },
+
+  "_LEGACY_BELOW": "=====================================================================",
+  "_LEGACY_note": "【B】以下键仅被 scripts/poller/（旧轮询器 sve-poller，已退役）与 scripts/probe/ 使用。",
+  "_LEGACY_note2": "当前架构是「客户端 + 服务器代理 + 订阅体系」：具体盯哪场赛事由界面里订阅决定（存在 app/client/data/subscriptions.json），不再由本文件的 tournament_id 指定。",
+  "_LEGACY_note3": "若你不再使用旧轮询器，可以整块忽略——代理与客户端都不会读它们。",
+
+  "tournament_id": "<赛事 id>",
+  "tournament_name": "<赛事名，用于校验，必须与接口返回完全一致>",
+  "active_start": "16:00",
+  "active_end": "23:59:59",
+  "interval_seconds": 15,
+  "jitter_ratio": 0.2,
+  "min_interval_seconds": 10,
+  "notify_cooldown_minutes": 10,
+  "notify_on_session_invalid": true,
+  "notify_on_recovery": true,
+  "auto_signup": {
+    "_comment": "【B】旧轮询器的自动报名开关。代理模式的自动报名由「订阅」决定，与此无关。",
+    "enabled": false,
+    "allowed_tournament_ids": [
+      "<赛事 id 白名单>"
+    ],
+    "expected_name": "<赛事名，必须完全一致>",
+    "verify_own_status": true,
+    "notify_every_step": true,
+    "max_attempts_per_hour": 6,
+    "allow_status_refresh": true,
+    "status_refresh_tries": 5,
+    "status_refresh_interval_seconds": 1.5,
+    "second_confirm_delay_seconds": 60,
+    "second_confirm_window_seconds": 90,
+    "confirm_retry_interval_seconds": 10
+  }
+}

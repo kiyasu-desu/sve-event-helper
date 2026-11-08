@@ -1,0 +1,30 @@
+[Unit]
+Description=SVE 调度线程与推进期限看护
+Documentation=file://__APP_DIR__/deploy/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 发送前已持久化退避；限制通知阻塞，避免吞掉后续分钟检查。
+TimeoutStartSec=55s
+User=__SVE_USER__
+Group=__SVE_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/sve/secrets.env
+UMask=0077
+StateDirectory=sve
+StateDirectoryMode=0700
+# 与代理使用同一私有环境及数据路径。
+Environment=TZ=Asia/Shanghai
+
+# 只读取 loopback 进度并按持久化状态告警，不启动报名执行器。
+ExecStart=__APP_DIR__/.venv/bin/python -B scripts/poller/watchdog.py --once --agent
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sve

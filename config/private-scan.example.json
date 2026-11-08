@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to ignored private-scan.json. Add exact real identifiers/secrets locally; never commit the filled file. Generic rules still run without it.",
+  "known_private": []
+}

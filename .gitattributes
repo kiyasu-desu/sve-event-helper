@@ -1,0 +1,48 @@
+# ===================================================================
+#  .gitattributes —— 锁定行尾符
+#
+#  为什么必需：Windows 上 git 默认 core.autocrlf=true，会在检出时把
+#  文本文件转成 CRLF。这对 .sh / .service / .timer 是**致命的**——
+#  bash 会报 `syntax error near unexpected token $'in\r'`，
+#  且报错位置指向毫不相干的 `case ... in`，极难定位。
+#  本项目在 Linux 服务器上运行，所以必须锁死为 LF。
+#
+#  仓库内的换行符自检：scripts/recon/check_lineendings.py
+# ===================================================================
+
+# 默认：由 git 判断是否文本，但不做平台转换
+* text=auto eol=lf
+
+# 必须 LF —— 在 Linux 上被 shell / systemd 直接执行
+*.sh        text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+
+# 期望 LF
+*.py        text eol=lf
+*.js        text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.html      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# PowerShell：Windows 上执行，用 CRLF 更稳妥。
+# 注意：含中文的 .ps1 必须存成 UTF-8 **with BOM**，否则 PS 5.1 会按 ANSI 解析。
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# 二进制 —— 不做任何转换
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.apk       binary
+*.zstd      binary
+*.db        binary
+*.flow      binary

@@ -1,0 +1,16 @@
+{
+  "_comment": "Synthetic format example only. Copy to signing-samples.json or set SVE_SIGNING_SAMPLES_FILE. Supply your own protected captures for actual analysis.",
+  "bruteforce_sign": {
+    "DEVICEID": "synthetic-device",
+    "SAMPLES": [{"body": {"uid": 10001, "tournament_id": "test-event", "action": "signup"}, "sign": "synthetic-signature"}]
+  },
+  "verify_sign": {
+    "UDID_CANDIDATES": ["synthetic-device", "unknown"],
+    "SAMPLES": [{"body": {"uid": 10001, "tournament_id": "test-event", "action": "signup"}, "sign": "synthetic-signature"}]
+  },
+  "list_sign": {
+    "UDID": "synthetic-device",
+    "TARGET": "synthetic-signature",
+    "RAW_QUERY": "_size=20&_page=1&area=example&is_sv2=0"
+  }
+}

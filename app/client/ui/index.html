@@ -1,0 +1,2360 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- PWA：可安装到手机主屏。start_url/scope 用相对路径，便于挂在子路径或反向代理之后。
+     注意：Service Worker 与「安装」提示都要求**安全上下文**。
+     http://<ip>:8801 这类地址不是安全上下文，届时 SW 会静默跳过、也不会出现安装入口——
+     这不是坏了。手机访问请用 Tailscale Serve 提供的 HTTPS，见 deploy/PWA-Tailscale.md -->
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#0f1116">
+<!-- Project metadata: repository URL verified against origin for M17. -->
+<meta name="sve-repository" content="https://github.com/kiyasu-desu/sve-event-helper">
+<link rel="apple-touch-icon" href="./apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SVE 赛事助手">
+<title>SVE 赛事助手</title>
+<style>
+  :root {
+    --bg: #0f1116; --panel: #171a21; --panel2: #1d2129; --line: #2a2f3a;
+    --fg: #dfe3ea; --dim: #8b93a3; --accent: #4fa3f7; --ok: #46c07a;
+    --warn: #e0a33e; --err: #e05a5a; --mine: #a97cf5;
+    --floating-size: 48px;
+    --batch-size: 64px;
+    --floating-gap: 16px;
+    --floating-bottom: calc(var(--floating-gap) + env(safe-area-inset-bottom, 0px));
+  }
+  * { box-sizing: border-box; }
+  /* The document handles pull-to-refresh; inner scroll areas keep their native scrolling. */
+  html { overscroll-behavior-y: none; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { padding: calc(6px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px))
+                   6px max(12px, env(safe-area-inset-left, 0px));
+           border-bottom: 1px solid var(--line); display: grid; align-items: center;
+           grid-template-columns: max-content minmax(0, 1fr) max-content 44px;
+           grid-template-areas: "title account clock menu";
+           gap: 8px; background: var(--panel); position: sticky; top: 0; z-index: 45; }
+  header h1 { grid-area: title; font-size: 16px; margin: 0; font-weight: 600; white-space: nowrap; }
+  #activeAcct { grid-area: account; min-width: 0; line-height: 1.6; }
+  #activeAcctLabel { display: block; }
+  #activeIdentity { display: flex; gap: .35em; min-width: 0; overflow-x: auto; white-space: nowrap; }
+  #activeNickname { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #activeUid { flex: none; }
+  #clock { grid-area: clock; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #navToggle { grid-area: menu; width: 44px; height: 44px; padding: 0; font-size: 20px; }
+  @media (max-width: 560px) {
+    header { grid-template-columns: minmax(0, 1fr) max-content 44px;
+             grid-template-areas: "title clock menu" "account account menu"; row-gap: 2px; }
+  }
+  #pageMenu { position: fixed; inset: 0 0 0 auto; margin: 0; padding: 0;
+              width: min(280px, 88vw); height: 100%; max-height: none;
+              border: 0; border-left: 1px solid var(--line); background: var(--panel); color: var(--fg); }
+  #pageMenu:not([open]) { display: none; }
+  #pageMenu::backdrop { background: rgba(0, 0, 0, .6); }
+  #batchDialog { width: min(640px, calc(100% - 24px)); max-height: 85vh; max-height: 85dvh;
+                 padding: 0; border: 1px solid var(--line); border-radius: 12px;
+                 background: var(--panel); color: var(--fg); overflow: hidden; }
+  #batchDialog:not([open]) { display: none; }
+  #batchDialog[open] { display: flex; flex-direction: column; }
+  #batchDialog::backdrop { background: rgba(0, 0, 0, .65); }
+  #batchDialog.fallback { position: fixed; inset: 0; margin: auto; z-index: 100;
+                          max-height: 85vh; }
+  #batchBackdrop { position: fixed; inset: 0; z-index: 99; background: rgba(0, 0, 0, .65); }
+  .batch-heading { display: flex; align-items: center; gap: 12px; padding: 12px; flex: none; }
+  .batch-heading h2 { margin: 0; flex: 1; color: var(--fg); }
+  #batchClose { min-width: 64px; min-height: 44px; }
+  #batchSummary { margin: 0; padding: 0 12px 12px; flex: none; }
+  #batchDetails { padding: 0 12px 12px; overflow-y: auto; overscroll-behavior: contain;
+                  min-height: 0; overflow-wrap: anywhere; }
+  #batchDetails p { margin: 0 0 8px; }
+  #pageMenu nav { height: 100%; display: flex; flex-direction: column; overflow: hidden;
+                  padding: calc(12px + env(safe-area-inset-top, 0px))
+                  max(12px, env(safe-area-inset-right, 0px))
+                  max(12px, env(safe-area-inset-bottom, 0px)) 12px; }
+  .menu-links { flex: 1; min-height: 0; overflow-y: auto; }
+  .menu-bottom { flex: none; padding-top: 12px; display: grid;
+                 grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+  .menu-bottom a { margin-bottom: 0 !important; }
+  #pageMenu #projectGithub { display: inline-flex; justify-self: start; align-items: center;
+                            justify-content: center; width: 48px; height: 48px; }
+  #pageMenu #projectGithub[hidden] { display: none; }
+  #projectGithub svg { width: 24px; height: 24px; fill: currentColor; }
+  #githubAccessHint { grid-column: 1 / -1; margin: 0; }
+  #pageMenu a { display: block; padding: 12px; margin-bottom: 8px; border-radius: 8px;
+                color: var(--fg); text-decoration: none; }
+  #pageMenu a[aria-current="page"] { background: var(--panel2); color: var(--accent); font-weight: 600; }
+  #pageMenu.inline-nav { display: block; position: static; width: auto; height: auto;
+                         border: 0; border-bottom: 1px solid var(--line); }
+  #pageMenu.inline-nav nav { display: flex; gap: 8px; min-height: 0; padding: 4px 12px; }
+  #pageMenu.inline-nav nav { flex-direction: row; flex-wrap: wrap; height: auto; }
+  #pageMenu.inline-nav .menu-bottom { margin: 0 0 0 auto; padding: 0; }
+  #pageMenu.inline-nav .menu-links { display: flex; flex-wrap: wrap; gap: 8px; overflow: visible; }
+  #pageMenu.inline-nav a { margin: 0; }
+  @media (prefers-reduced-motion: no-preference) {
+    #pageMenu[open] { animation: open-menu .18s ease-out; }
+    @keyframes open-menu { from { transform: translateX(100%); } }
+  }
+  #eventsPage[hidden] { display: none; }
+  #settingsPage[hidden] { display: none; }
+  #settingsPage { display: grid; gap: 14px; padding: 14px; max-width: 800px; margin: 0 auto;
+                  padding-bottom: calc(var(--floating-bottom) + var(--floating-size) + var(--floating-gap)); }
+  #settingsPage section { min-width: 0; overflow-wrap: anywhere; }
+  #settingsHeading { margin: 0; color: var(--fg); font-size: 16px; letter-spacing: normal; }
+  #eventsPage { display: grid; grid-template-columns: 300px 1fr 380px; gap: 14px; padding: 14px; }
+  @media (max-width: 1200px) {
+      #eventsPage { grid-template-columns: 1fr; }
+      /* 折叠成单列后，内联的 `grid-column: span 2` 会在 1fr 网格里**隐式造出第二列**，
+         于是布局又变回两栏并把视口撑宽（实测手机 390px 视口下 innerWidth 变成 456，
+         账号名被硬折行）。该 section 用的是内联样式，必须 !important 才能覆盖。 */
+      #eventsPage > section { grid-column: auto !important; }
+    }
+    /* 窄屏：收紧内边距并让按键更易点（最小必要改动，不重设计） */
+    @media (max-width: 560px) {
+      #eventsPage { padding: 10px; gap: 10px; }
+      .card { padding: 10px; }
+      .row { flex-wrap: wrap; }
+      button { min-height: 34px; }
+    }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--dim); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .06em; }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 7px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  button.small { padding: 3px 9px; font-size: 12px; }
+  .floating-button { position: fixed; bottom: var(--floating-bottom); z-index: 40;
+                     width: var(--floating-size); height: var(--floating-size); padding: 0;
+                     display: grid; place-items: center; border-radius: 50%;
+                     background: var(--accent); color: #06121f; border-color: var(--accent);
+                     box-shadow: 0 4px 12px rgba(0, 0, 0, .35); }
+  .floating-button[hidden] { display: none; }
+  .floating-button:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  #backToTop { right: calc(var(--floating-gap) + env(safe-area-inset-right, 0px));
+               font-size: 24px; font-weight: 600; line-height: 1; }
+  #btnBatch { left: calc(var(--floating-gap) + env(safe-area-inset-left, 0px));
+              width: var(--batch-size); height: var(--batch-size); font-size: 1rem;
+              font-weight: 600; line-height: 1.15; white-space: pre-line; }
+  #btnBatch:disabled { opacity: .65; cursor: wait; }
+/* 行内动作按钮固定最小宽度：文案在「订阅 / 取消订阅 / 处理中…」之间切换时
+   不得改变宽度，否则卡片内会横向位移，相邻元素跟着抖（实测会导致误点）。 */
+button.small.act { min-width: 84px; text-align: center; }
+  #ptr { position: fixed; top: var(--ptr-anchor, 0px); left: 50%; z-index: 44;
+         width: var(--floating-size); height: var(--floating-size); border-radius: 50%;
+         display: grid; place-items: center; pointer-events: none;
+         background: var(--panel2); color: var(--accent); border: 1px solid var(--line);
+         box-shadow: 0 4px 12px rgba(0, 0, 0, .35); font-size: 24px; opacity: 0;
+         transform: translate(-50%, calc(var(--ptr-distance, 0px) - 100%));
+         transition: transform .18s ease-out, opacity .18s ease-out; }
+  #ptr[data-state] { opacity: 1; }
+  #ptr[data-state="pulling"], #ptr[data-state="ready"] { transition: none; }
+  #ptr[data-state="ready"] { color: #06121f; background: var(--accent); border-color: var(--accent); }
+  #ptr[data-state="busy"]::before {
+    content: ""; width: 20px; height: 20px; border: 2px solid var(--line);
+    border-top-color: var(--accent); border-radius: 50%; animation: ptrspin .7s linear infinite;
+  }
+  #pageMenu[open] ~ #ptr { visibility: hidden; }
+  #ptrStatus { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; overflow: hidden;
+               clip-path: inset(50%); white-space: nowrap; }
+  @keyframes ptrspin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    #ptr { transition: none; }
+    #ptr[data-state="busy"]::before { animation: none; }
+  }
+  /* 勾选框：加大触摸目标，手机上更好点 */
+  input.pick { flex: 0 0 auto; width: 18px; height: 18px; margin: 4px 10px 0 0;
+               accent-color: var(--accent); }
+  select { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 7px; padding: 7px; font-size: 13px; width: 100%; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+          padding: 10px; margin-bottom: 8px; }
+  .card .title { font-weight: 600; }
+  .muted { color: var(--dim); font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+         border: 1px solid var(--line); }
+  .g-open { color: #06121f; background: var(--ok); border-color: var(--ok); font-weight: 600; }
+  .g-bookable { color: #06121f; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .g-mine { background: var(--mine); border-color: var(--mine); color: #14061f; font-weight: 600; }
+  .g-full { background: var(--warn); border-color: var(--warn); color: #1f1406; font-weight: 600; }
+  .g-ended, .g-other { color: var(--dim); }
+  .g-running, .g-checkin { background: #3a4150; }
+  #log { background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px; height: 420px; overflow: auto; font: 12px/1.5 Consolas, monospace;
+         white-space: pre-wrap; word-break: break-all; }
+  .scroll { max-height: 520px; overflow: auto; }
+  #acctList { margin-top: 6px; overflow-anchor: none; overflow-wrap: anywhere; }
+  .acct-info { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+               align-items: start; gap: 8px; }
+  .acct-info .pick { margin: 4px 0 0; }
+  .acct-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .acct-info button, .acct-actions button { min-height: 40px; white-space: nowrap; }
+  .acct-info .acct-switch { min-width: 56px; background: var(--ok); color: #06121f; border-color: var(--ok); }
+  .acct-actions .acct-refresh { min-width: 84px; background: var(--accent); color: #06121f; border-color: var(--accent); }
+  .acct-actions .acct-refresh:disabled { opacity: .65; cursor: default; }
+  .acct-actions .acct-delete { min-width: 56px; background: var(--err); color: #06121f; border-color: var(--err); }
+  input[type=text], input[type=password], input[type=number] { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+                     border-radius: 7px; padding: 7px; font-size: 13px; width: 100%; }
+  .banner { padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
+  .banner.ok { background: #12331f; border: 1px solid #1f5c37; }
+  .banner.err { background: #3a1616; border: 1px solid #7a2b2b; }
+  .banner.info { background: #12263a; border: 1px solid #24466b; }
+  .hi { color: #ffd479; font-weight: 600; }
+  .cls-major { background: #4a2f6b; border-color: #6c47a0; color: #e8d9ff; font-weight: 600; }
+  .cls-points { background: #1f3b52; border-color: #2f5f80; color: #cfe8ff; }
+  .cls-casual { background: #3a3320; border-color: #6b5b2a; color: #ffeec2; }
+  .fee { color: #ff5c5c; font-weight: 600; }
+  .free { color: var(--dim); }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-size: 12px; color: var(--dim); }
+  .toolbar label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+
+  #subsPage { padding:14px; max-width:1500px; margin:0 auto; }
+  /* Keep the final card above the floating controls at the end of either page. */
+  #eventsPage, #subsPage {
+    padding-bottom: calc(var(--floating-bottom) + var(--floating-size) + var(--floating-gap));
+  }
+  #eventsPage {
+    padding-bottom: calc(var(--floating-bottom) + var(--batch-size) + var(--floating-gap));
+  }
+  #subsPage a { color:var(--accent); }
+  .subs-toolbar { display:flex; align-items:center; gap:8px 14px; flex-wrap:wrap; margin-bottom:10px; }
+  .subs-toolbar h2 { flex-basis:100%; margin:0; }
+  .acct-group { background:var(--panel); border:1px solid var(--line);
+                border-radius:10px; padding:12px; margin-bottom:14px; }
+  .acct-group > h2 { font-size:14px; color:var(--fg); overflow-wrap:anywhere; margin:0 0 10px; display:flex; align-items:center; gap:8px; }
+  /* minmax(460px,1fr) 在窄屏（如 390px）上会强制列宽 ≥460px，
+     把容器撑得比视口宽 → 横向溢出、左侧内容被裁（实测踩到）。
+     用 min(460px,100%) 让列宽永不超出容器，窄屏自然退化为单列。 */
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(460px,100%),1fr)); gap:10px; }
+  #subsPage .card { padding:0; margin:0; min-width:0; overflow-wrap:anywhere; }
+  .head { padding:10px; cursor:pointer; user-select:none; }
+  .head:hover { background:#232833; border-radius:8px; }
+  .head .title { font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .head .caret { color:var(--dim); font-size:11px; margin-left:auto; }
+  .body { padding:0 10px 10px; border-top:1px solid var(--line); }
+  pre.log { background:#0b0d12; border:1px solid var(--line); border-radius:6px;
+            padding:6px 8px; margin:8px 0 0; height:220px; overflow:auto; overflow-anchor:none;
+            font:11px/1.5 Consolas,monospace; white-space:pre-wrap; word-break:break-all; }
+  pre.log > span { display:block; min-height:1.5em; }
+  .empty { color:var(--dim); padding:20px; text-align:center; }
+  .pill { padding:2px 8px; border-radius:9px; background:#2b3040; font-size:12px; }
+  /* 折叠卡片上的"最新一条日志"预览。
+     原先用 nowrap + ellipsis 截断——但日志行（含时间戳、窗口描述、秒数）
+     恰恰是用户最需要完整读到的信息，截断后只剩半句（实测踩到）。
+     改为**换行**显示：长行换到下一行继续，不用横向滚动，也不省略。 */
+  .latest { margin-top:4px; font:11px/1.5 Consolas,monospace; color:#9fd0ff;
+            white-space:normal; overflow-wrap:anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="appTitle" tabindex="-1">SVE 赛事助手</h1>
+  <span class="muted" id="activeAcct">
+    <span id="activeAcctLabel">当前账号:</span>
+    <span id="activeIdentity"><span id="activeNickname">未登录</span><span id="activeUid" hidden></span></span>
+  </span>
+  <span class="muted" id="clock"></span>
+  <button id="navToggle" type="button" aria-label="打开页面菜单" aria-haspopup="dialog"
+          aria-controls="pageMenu" aria-expanded="false">☰</button>
+</header>
+
+<dialog id="pageMenu" aria-label="页面菜单">
+  <nav>
+    <div class="menu-links">
+      <a href="./" data-page="events">赛事列表</a>
+      <a href="./subs" data-page="subs">自动报名订阅</a>
+    </div>
+    <div class="menu-bottom">
+      <a id="projectGithub" target="_self" rel="noreferrer" aria-label="打开项目 GitHub 仓库"
+         aria-describedby="githubAccessHint" hidden>
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M 8 0 C 3.58 0 0 3.58 0 8 c 0 3.54 2.29 6.53 5.47 7.59 .4 .07 .55 -.17 .55 -.38 0 -.19 -.01 -.82 -.01 -1.49 -2.01 .37 -2.53 -.49 -2.69 -.94 -.09 -.23 -.48 -.94 -.82 -1.13 -.28 -.15 -.68 -.52 -.01 -.53 .63 -.01 1.08 .58 1.23 .82 .72 1.21 1.87 .87 2.33 .66 .07 -.52 .28 -.87 .51 -1.07 -1.78 -.2 -3.64 -.89 -3.64 -3.95 0 -.87 .31 -1.59 .82 -2.15 -.08 -.2 -.36 -1.02 .08 -2.12 0 0 .67 -.21 2.2 .82 A 7.65 7.65 0 0 1 8 3.86 c .68 0 1.36 .09 2 .27 1.53 -1.04 2.2 -.82 2.2 -.82 .44 1.1 .16 1.92 .08 2.12 .51 .56 .82 1.27 .82 2.15 0 3.07 -1.87 3.75 -3.65 3.95 .29 .25 .54 .73 .54 1.48 0 1.07 -.01 1.93 -.01 2.2 0 .21 .15 .46 .55 .38 A 8.013 8.013 0 0 0 16 8 c 0 -4.42 -3.58 -8 -8 -8 Z"/></svg>
+      </a>
+      <a href="./settings" data-page="settings">设置</a>
+      <p id="githubAccessHint" class="muted">私有仓库需 GitHub 登录及访问权限。</p>
+    </div>
+  </nav>
+</dialog>
+
+<div id="batchBackdrop" hidden></div>
+<dialog id="batchDialog" aria-labelledby="batchTitle" aria-describedby="batchSummary">
+  <div class="batch-heading">
+    <h2 id="batchTitle">批量报名结果</h2>
+    <button id="batchClose" type="button" autofocus>关闭</button>
+  </div>
+  <p id="batchSummary" role="status"></p>
+  <div id="batchDetails" tabindex="0" role="region" aria-label="逐项报名结果"></div>
+</dialog>
+
+<main id="eventsPage">
+  <!-- 账号 -->
+  <section>
+    <h2 id="accountsHeading">账号</h2>
+    <!-- 「新增账号」走网页按钮：在 App 内点它会通过原生通道打开登录页；
+         在纯浏览器里给出可操作提示（不再出现"找不到 Chrome 或 Edge"那种报错）。 -->
+    <button id="btnLogin" class="primary" style="width:100%">新增账号</button>
+    <div id="loginBox" style="margin-top:8px"></div>
+    <div class="toolbar" style="margin-top:6px">
+      <span class="muted">勾选账号可参与「一键报名」</span>
+    </div>
+    <div id="connectionStatus" class="banner err" role="status" style="display:none"></div>
+    <div id="acctList" class="scroll" role="region" aria-labelledby="accountsHeading" tabindex="0"></div>
+  </section>
+
+  <!-- 可订阅 / 报名 -->
+  <section style="grid-column: span 2">
+    <h2>可订阅 / 报名</h2>
+    <div class="row" style="margin-bottom:8px">
+      <select id="province" style="flex:1"></select>
+      <select id="city" style="flex:1"></select>
+      <button id="btnLoad">查询</button>
+    </div>
+    <div class="toolbar">
+      <span id="listInfo"></span>
+    </div>
+    <div id="listNotice" class="banner info" style="display:none"></div>
+    <!-- 状态行：外面套一个**预留高度**的容器。
+         否则它一出现就在列表上方插入一个元素，把整个列表往下推——
+         实测点击「订阅」后卡片 y 从 182 跳到 231，正是"点完位移导致误点"的来源。
+         预留高度后，它出现/消失都不影响下方内容的位置。 -->
+    <div style="min-height:44px"><div id="actionStatus" class="banner" style="display:none"></div></div>
+    <div class="scroll" id="tourList"></div>
+  </section>
+
+  <!-- 已订阅 / 报名：**只显示当前所选地区**里我已订阅或已报名的赛事。
+       原先这里用 /api/my_tournaments（跨地区全量在册记录），用户明确要求去掉那个全量列表。 -->
+  <section>
+    <h2>已订阅 / 报名</h2>
+    <div class="toolbar">
+      <span id="myInfo"></span>
+    </div>
+    <div class="scroll" id="myList" style="max-height:420px"></div>
+  </section>
+
+</main>
+
+<main id="settingsPage" hidden aria-labelledby="settingsHeading">
+  <h2 id="settingsHeading">设置</h2>
+  <div id="settingsConnectionStatus" class="banner info" role="status">正在读取最新设置状态…</div>
+  <div id="settingsActionStatus" class="banner" role="status" style="display:none"></div>
+  <!-- 远端执行：订阅与自动报名交给服务器，本机只做交互与登录 -->
+  <section>
+    <h2>自动报名执行位置</h2>
+    <div id="remoteBox">正在读取执行位置…</div>
+    <details style="margin-top:10px">
+      <summary class="muted" style="cursor:pointer">服务器连接设置</summary>
+      <div style="margin-top:8px">
+        <div class="muted">主机（IP 或域名）</div>
+        <input type="text" id="rmHost" placeholder="请输入服务器地址" autocomplete="off">
+        <div class="muted" style="margin-top:6px">登录用户</div>
+        <input type="text" id="rmUser" placeholder="请输入登录用户" autocomplete="off">
+        <div class="muted" style="margin-top:6px">私钥路径（留空保留；未配置时使用系统身份）</div>
+        <input type="password" id="rmKey" placeholder="请输入私钥路径" autocomplete="off">
+        <div class="row" style="margin-top:6px">
+          <div style="flex:1">
+            <div class="muted">SSH 端口</div>
+            <input type="number" id="rmSshPort" min="1" max="65535" placeholder="请输入端口" autocomplete="off">
+          </div>
+          <div style="flex:1">
+            <div class="muted">本地转发端口</div>
+            <input type="number" id="rmLocalPort" min="1" max="65535" placeholder="请输入端口" autocomplete="off">
+          </div>
+        </div>
+        <p class="muted">文本和端口留空保留原配置；首次配置默认 SSH 端口 22、转发端口 8901。</p>
+        <div id="remoteFieldsStatus" class="muted" role="status"></div>
+        <div class="row" style="margin-top:10px">
+          <button id="btnRemoteOn" class="primary">启用远端执行</button>
+          <button id="btnRemoteOff">切回本机执行</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="btnPushAccounts">比较两端账号</button>
+          <span class="muted">不覆盖或删除服务器账号；新增/更新会话请重新登录。远端账号需在服务器界面明确删除。</span>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- 通知设置：凭据写入 <DATA_DIR>/notify.json，不落在仓库里 -->
+  <section>
+    <h2>通知设置</h2>
+    <div id="notifyBox" role="status">正在读取通知设置…</div>
+    <details id="notifyDetails" style="margin-top:8px">
+      <summary class="muted" style="cursor:pointer">编辑通知渠道</summary>
+      <div style="margin-top:10px" id="notifyForm"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="btnNotifySave" class="primary">保存</button>
+        <button id="btnNotifyTest">发送测试通知</button>
+      </div>
+      <p class="muted" style="margin-top:8px">
+        文本、密钥和端口<b>留空表示不修改</b>，成功保存后输入清空。
+        环境变量字段只读；SMTP 首次未填写端口时默认 465，未配置发件人时使用邮件账号。
+      </p>
+    </details>
+  </section>
+</main>
+
+<main id="subsPage" hidden>
+  <div class="subs-toolbar">
+    <h2>自动报名订阅</h2>
+    <span class="muted" id="summary" role="status">正在读取订阅资料…</span>
+    <button id="btnExpandAll" type="button">全部展开/折叠</button>
+  </div>
+  <div style="min-height:44px"><div id="subsStatus" class="banner" role="status" style="display:none"></div></div>
+  <div id="groups"></div>
+</main>
+
+<div id="ptr" aria-hidden="true"></div>
+<span id="ptrStatus" role="status"></span>
+<button id="backToTop" class="floating-button" type="button" aria-label="返回顶部" hidden>↑</button>
+<button id="btnBatch" class="floating-button" type="button" aria-label="一键报名" hidden disabled>一键&#10;报名</button>
+
+<script>
+const $ = (id) => document.getElementById(id);
+// 赛事页与订阅页在同一目录，API 也经同一部署前缀访问。
+const APP_ROOT = location.pathname.replace(/^\/+/, "/").replace(/[^/]*$/, "");
+const GROUP_LABEL = { open: "可报名", bookable: "可预约", mine: "我的", full: "已报满",
+                      checkin: "签到中", running: "赛事中", ended: "已结束", other: "其它" };
+
+let ACCOUNT_ID = null;
+let ACCOUNT_EPOCH = 0;
+let ACCOUNT_ROWS = new Map();
+let REFRESH_SEQUENCE = 0;
+let SETTLED_REFRESH_SEQUENCE = 0;
+let TOUR_SEQUENCE = 0;
+function accountLabel(id) {
+  const row = ACCOUNT_ROWS.get(String(id));
+  return row ? `${row.nickname || row.name} (UID ${row.account_id})` : `UID ${id}`;
+}
+
+function renderActiveAccount() {
+  const row = ACCOUNT_ROWS.get(ACCOUNT_ID);
+  const nickname = row ? (row.nickname || row.name || "未命名账号") : "未登录";
+  $("activeNickname").textContent = nickname;
+  $("activeNickname").title = nickname;
+  // account_id is a canonical decimal string. Never convert it to a JS Number.
+  $("activeUid").textContent = row ? `(${ACCOUNT_ID})` : "";
+  $("activeUid").hidden = !row;
+}
+
+async function api(path, opts) {
+  // 加时间戳破缓存：切换账号后请求 URL 完全相同，浏览器可能直接复用旧响应，
+  // 表现为"列表还是旧账号的报名信息"。服务端也加了 no-store 头，这里双保险。
+  opts = Object.assign({}, opts || {});
+  const original = path.split("?")[0];
+  const bound = new Set(["/api/tournaments", "/api/my_tournaments", "/api/detail", "/api/enroll", "/api/cancel", "/api/subscribe", "/api/unsubscribe"]);
+  if (bound.has(original)) {
+    if (!ACCOUNT_ID) return {ok:false, error:"请先选择账号"};
+    if (opts.method === "POST") {
+      const payload = JSON.parse(opts.body || "{}");
+      if (!payload.account_id) payload.account_id = ACCOUNT_ID;
+      payload.expected_version = ACCOUNT_ROWS.get(payload.account_id)?.version;
+      opts.body = JSON.stringify(payload);
+    } else {
+      path += (path.includes("?") ? "&" : "?") + "account_id=" + encodeURIComponent(ACCOUNT_ID);
+    }
+  }
+  if (original === "/api/state" && ACCOUNT_ID) path += "?account_id=" + encodeURIComponent(ACCOUNT_ID);
+  return requestJson(path, opts);
+}
+
+async function requestJson(path, opts) {
+  const url = APP_ROOT + path.slice(1) + (path.includes("?") ? "&" : "?") + "_=" + Date.now();
+  const response = await fetch(url, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
+  return response.json();
+}
+
+function collapseList(reason) {
+  // 折叠列表用于防止"手快误操作"：
+  // 切换账号后列表内容仍是旧账号的（报名状态/人数/可报名与否都变了），
+  // 此时若直接点「订阅」，会把赛事绑定到错误的账号上。
+  TOURS = [];
+  const box = $("tourList");
+  box.innerHTML = "";
+  box.style.display = "none";
+  const n = $("listNotice");
+  n.style.display = "block";
+  n.textContent = reason;
+  $("listInfo").textContent = "";
+}
+
+function expandList() {
+  $("tourList").style.display = "";
+  $("listNotice").style.display = "none";
+}
+
+function clearAccountView(reason) {
+  renderActiveAccount();
+  tournamentQueryError = "";
+  PENDING.clear(); CONFIRMED.clear(); ENROLLED.clear(); MINE = new Set();
+  MY_TOURS = []; PICK_TOURS.clear();
+  collapseList(reason);
+  renderMyList();
+}
+
+function profileText(a) {
+  const last = a.profile_updated_at ? new Date(a.profile_updated_at * 1000).toLocaleString() : "尚无成功刷新记录";
+  const errors = {identity_mismatch:"官方身份不符", upstream_error:"官方接口暂不可用", invalid_response:"资料格式异常"};
+  const next = a.profile_next_refresh_at ? new Date(a.profile_next_refresh_at * 1000).toLocaleTimeString() : "稍后";
+  return `最近成功：${last} · ${a.profile_refreshing ? "刷新中" : a.profile_error ? (errors[a.profile_error] || "刷新失败") : "等待刷新"} · 下次：${next}`;
+}
+
+let accountListDetails;
+let lastAccountMarkup;
+
+function renderAccountList() {
+  if (!accountListDetails) return;
+  const {pendingCount, deleted} = accountListDetails;
+  let markup = Array.from(ACCOUNT_ROWS.values(), a => `
+    <div class="card">
+      <div class="acct-info">
+        <input type="checkbox" class="pick" data-kind="acct" data-id="${esc(a.account_id)}"
+               aria-label="勾选 ${esc(accountLabel(a.account_id))} 参与一键报名">
+        <div>
+          <div class="title">${esc(a.nickname || a.name)} ${a.active ? '<span class="tag g-mine">当前</span>' : ''}</div>
+          <div class="muted">UID ${esc(a.account_id)} · ${esc(a.mobile || '')}</div>
+          <div class="muted">${esc(profileText(a))}</div>
+        </div>
+        ${a.active ? '' : `<button class="small acct-switch" onclick="selectAcct('${a.account_id}')">切换</button>`}
+      </div>
+      <div class="acct-actions">
+        <button class="small acct-refresh" onclick="refreshProfile('${a.account_id}')"${a.profile_refreshing ? " disabled" : ""}>${a.profile_refreshing ? "刷新中…" : "刷新资料"}</button>
+        <button class="small acct-delete" onclick="forgetAcct('${a.account_id}')">删除</button>
+      </div>
+    </div>`).join("") || '<div class="muted">还没有账号</div>';
+  if (pendingCount) {
+    markup += `<div class="banner info">有 ${Number(pendingCount)} 项旧数据等待身份核对，原件已保留，未自动报名。请查看受保护的迁移报告。</div>`;
+  }
+  if (deleted.length) {
+    markup += '<details><summary>已删除账号（历史保留）</summary>' +
+      deleted.map(a => `<div class="row"><span>${esc(a.label)}</span><button class="small" onclick="restoreAcct('${a.account_id}',${a.version})">重新登录恢复</button></div>`).join("") + '</details>';
+  }
+  // Keep unchanged rows and controls in place between polls.
+  if (markup === lastAccountMarkup) return;
+  const list = $("acctList");
+  const scrollTop = list.scrollTop;
+  const historyOpen = list.querySelector("details")?.open;
+  list.innerHTML = markup;
+  if (historyOpen && deleted.length) list.querySelector("details").open = true;
+  list.querySelectorAll('input.pick').forEach(input => {
+    input.checked = PICK_ACCTS.has(input.dataset.id);
+  });
+  list.scrollTop = scrollTop;
+  lastAccountMarkup = markup;
+}
+
+async function refreshProfile(id) {
+  const row = ACCOUNT_ROWS.get(id);
+  if (!row) return;
+  try {
+    const r = await api("/api/account/profile/refresh", {method:"POST",
+      body:JSON.stringify({account_id:id, expected_version:row.version})});
+    setStatus(r.ok ? "资料刷新已排队" : (r.error || "资料刷新失败"), r.ok ? "ok" : "err");
+  } catch (e) { setStatus("网络不可用，保留最近资料", "err"); }
+  await refresh();
+}
+
+async function refresh({signal, reloadEventsOnAccountChange = true} = {}) {
+  const visit = pageVisit;
+  const sequence = ++REFRESH_SEQUENCE;
+  const epoch = ACCOUNT_EPOCH;
+  try {
+    const s = await api("/api/state", {signal});
+    // A newer request still in flight must not starve a valid slow response.
+    if (signal?.aborted || sequence < SETTLED_REFRESH_SEQUENCE || epoch !== ACCOUNT_EPOCH) return;
+    SETTLED_REFRESH_SEQUENCE = sequence;
+    subscriptionView.update(s);
+    if (!s.ok) {
+      markSettingsUnavailable();
+      requireEventState(sequence + 1);
+      $("connectionStatus").textContent = "暂时无法取得最新资料，请检查连接或存储";
+      $("connectionStatus").style.display = "block";
+      if (s.code === "identity_conflict" && ACCOUNT_ID) {
+        ACCOUNT_ID = null; ACCOUNT_EPOCH++; LAST_ACTIVE = null;
+        clearAccountView("账号身份已变化，正在重新读取账号列表…");
+      }
+      if (s.code === "storage_unavailable") {
+        ACCOUNT_ID = null; ACCOUNT_EPOCH++; LAST_ACTIVE = null;
+        clearAccountView("存储待核对，执行已暂停");
+        setStatus("存储待核对，执行已暂停", "err");
+      }
+      return;
+    }
+    $("connectionStatus").style.display = "none";
+    $("settingsConnectionStatus").style.display = "none";
+    ACCOUNT_ROWS = new Map((s.accounts || []).map(a => [a.account_id, a]));
+    document.querySelectorAll("[data-account-label]").forEach(el => {
+      el.textContent = accountLabel(el.dataset.accountLabel);
+    });
+    ACCOUNT_ID = s.active_account_id || null;
+    // 账号变化时：先立刻折叠（清掉旧账号的数据，挡住这段"陈旧窗口"里的误点），
+    // 再自动按新账号加载，加载完自动展开——不需要手工点「查询」，也不弹窗。
+    if (LAST_ACTIVE !== undefined && ACCOUNT_ID !== LAST_ACTIVE) {
+      LAST_ACTIVE = ACCOUNT_ID;
+      ACCOUNT_EPOCH++;
+      if (ACCOUNT_ID) {
+        clearAccountView("已切换为账号「" + accountLabel(ACCOUNT_ID) + "」，正在按新账号加载赛事列表…");
+        if (reloadEventsOnAccountChange && (currentPage === "events" || !currentPage)) loadTournaments();
+        loadMyTournaments();      // 我的赛事跟着账号走，切换后必须重查
+      } else {
+        clearAccountView("当前未登录账号。请先登录。");
+      }
+    } else if (LAST_ACTIVE === undefined) {
+      LAST_ACTIVE = ACCOUNT_ID;
+    }
+    // 账号
+    renderActiveAccount();
+    const previousPickCount = PICK_ACCTS.size;
+    for (const id of PICK_ACCTS) if (!ACCOUNT_ROWS.has(id)) PICK_ACCTS.delete(id);
+    if (PICK_ACCTS.size !== previousPickCount) updateBatchButton();
+    accountListDetails = {pendingCount:s.pending_count, deleted:s.deleted_accounts || []};
+    if (currentPage === "events" || !currentPage) renderAccountList();
+
+    // 登录进度
+    const lg = s.login || {};
+    if (lg.running) $("loginBox").innerHTML = `<div class="banner info">${esc(lg.message || '正在登录…')}</div>`;
+    else if (lg.ok) $("loginBox").innerHTML = `<div class="banner ok">${esc(lg.message)}</div>`;
+    else if (lg.error) $("loginBox").innerHTML = `<div class="banner err">${esc(lg.error)}</div>`;
+    else if (lg.notice) $("loginBox").innerHTML = `<div class="banner info">${esc(lg.notice)}</div>`;
+    else $("loginBox").innerHTML = "";
+
+    // Configuration values remain on the execution side; display status only.
+    renderRemoteStatus(s.remote || {});
+
+    // 「新增账号」的可见性：分两种环境，不能只看 can_login。
+    //
+    //   App 内（window.__SVE_APP__）→ 走原生通道 sve://login 打开登录页，
+    //                               **不依赖服务器有没有浏览器** → 必须显示。
+    //                               早先只判 can_login，导致服务器无浏览器时
+    //                               按钮在 App 里也被隐藏（实测踩到）。
+    //   浏览器内 → 网页登录要靠本机开真浏览器读 Cookie，才看 can_login。
+    //             缺字段时按"能登录"处理，避免旧后端被误禁用。
+    const canLogin = inApp() || s.can_login !== false;
+    $("btnLogin").style.display = canLogin ? "" : "none";
+
+    // 合并服务器状态与"仍未确认"的乐观操作：这期间后台轮询不得把刚点下去的
+    // 订阅状态覆盖回旧值——否则按钮会跳回去，用户以为没点上而重复点。
+    const nextMine = new Set((s.mine || []).map(String));
+    const now = Date.now();
+    for (const [tid, kind] of PENDING) {
+      if (kind === "subscribe") nextMine.add(tid);
+      else if (kind === "unsub") nextMine.delete(tid);
+    }
+    // 宽限期内的"刚确认"状态同样优先于服务器读数（见 CONFIRMED 的说明）
+    for (const [tid, rec] of Array.from(CONFIRMED)) {
+      if (now > rec.until) { CONFIRMED.delete(tid); continue; }
+      if (nextMine.has(tid) === rec.want) { CONFIRMED.delete(tid); continue; }  // 已一致
+      if (rec.want) nextMine.add(tid); else nextMine.delete(tid);
+    }
+    MINE = nextMine;
+    if (requiredEventStateSequence != null && sequence >= requiredEventStateSequence) {
+      requiredEventStateSequence = null;
+      if (!tournamentsUnverified) renderSections();
+    }
+  } catch (e) {
+    if ((!signal || visit === pageVisit) && sequence >= SETTLED_REFRESH_SEQUENCE && epoch === ACCOUNT_EPOCH) {
+      SETTLED_REFRESH_SEQUENCE = sequence;
+      requireEventState(sequence + 1);
+      subscriptionView.update({ok:false, error:"网络不可用，正在显示最近取得的订阅资料"});
+      $("connectionStatus").textContent = "网络不可用，正在显示最近取得的账号资料";
+      $("connectionStatus").style.display = "block";
+      markSettingsUnavailable();
+    }
+  }
+}
+
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+let STATUS_TIMER = null;
+function setStatus(msg, kind) {
+  // 用独立的状态行显示操作结果：不能用 listInfo（每次刷新列表都会被覆盖），
+  // 也不用 alert——目标是"少弹窗"。
+  const el = $("actionStatus");
+  el.textContent = msg;
+  el.className = "banner " + (kind === "err" ? "err" : kind === "ok" ? "ok" : "info");
+  el.style.display = "block";
+  if (STATUS_TIMER) clearTimeout(STATUS_TIMER);
+  STATUS_TIMER = setTimeout(() => { el.style.display = "none"; }, 9000);
+}
+function groupOf(status) {
+  if (!status) return "other";
+  if (status === "可报名") return "open";
+  // 补录：赛事处于「签到 → 开赛」之间时，服务端允许补录，官方 App 显示为「可补录」。
+  // ⚠️ 必须放在下面的 startsWith("签到") **之前**——否则「签到中-可补录」
+  //    会先被归成 checkin，界面不给「立即报名」按钮（这正是要修的缺陷）。
+  // 用 includes 而非精确相等：实测采样 5546 场都没抓到该状态，措辞无法穷举。
+  if (status.includes("补录")) return "open";
+  if (status === "可预约") return "bookable";
+  // 「签到中」（**无**「-未报名」后缀）= 该账号**已报名**、正在签到 → 归入「已报名」。
+  // 实测（赛事 34043、9 个账号、同一时刻）：显示「签到中」的 5 个**全部在参与记录里**，
+  // 显示「签到中-未报名」的 4 个**全部不在**。所以它是"已在赛事中"，不是"可处理"。
+  // ⚠️ 顺序关键：必须在下面的 startsWith("签到") **之前**。
+  if (status.startsWith("签到") && !status.includes("未报名")) return "mine";
+  if (status === "已报名" || status === "已预约") return "mine";
+  if (status === "已报满") return "full";
+  if (status.startsWith("签到")) return "checkin";
+  if (status.startsWith("赛事中")) return "running";
+  if (status === "已结束") return "ended";
+  return "other";
+}
+
+let TOURS = [];
+let AREAS = [];
+let tournamentsUnverified = false;
+let requiredEventStateSequence = null;
+let tournamentQueryError = "";
+let areasRequest;
+let LAST_ACTIVE;   // 记录上次看到的激活账号，用于检测切换
+let MINE = new Set();   // 当前账号已订阅的赛事 id（由 /api/state 提供）
+let MY_TOURS = [];      // 当前账号的「我的赛事」（服务端 mine=1 筛选）
+let REMOTE_ON = false;  // 是否处于「服务器执行」模式
+
+// ------------------------------------------------------------------ 通知设置
+const NOTIFY_FIELDS = {
+  pushplus: [["enabled", "启用"], ["token", "Token"]],
+  email: [["enabled", "启用"], ["smtp_host", "SMTP 服务器"], ["smtp_port", "端口"],
+          ["use_ssl", "SSL"], ["username", "账号"], ["authcode", "授权码"],
+          ["from_addr", "发件人"], ["to_addrs", "收件人（逗号分隔）"]],
+};
+let NOTIFY_CFG = null;
+let NOTIFY_SEQUENCE = 0;
+let notifyFormDirty = false;
+let notifyEditVersion = 0;
+let remoteEditVersion = 0;
+const REMOTE_INPUTS = ["rmHost", "rmUser", "rmKey", "rmSshPort", "rmLocalPort"];
+for (const id of REMOTE_INPUTS) $(id).addEventListener("input", () => { remoteEditVersion++; });
+
+function resetSettingsInputs() {
+  notifyEditVersion++; remoteEditVersion++; NOTIFY_SEQUENCE++;
+  for (const id of REMOTE_INPUTS) $(id).value = "";
+  NOTIFY_CFG = null; notifyFormDirty = false;
+  $("notifyForm").innerHTML = "";
+  $("settingsActionStatus").textContent = "";
+  $("settingsActionStatus").style.display = "none";
+}
+
+function settingsMessage(result, fallback) {
+  const labels = {host:"服务器地址",user:"登录用户",key:"私钥路径",ssh_port:"SSH 端口",local_port:"转发端口",
+    "pushplus.token":"通知密钥","email.smtp_host":"SMTP 服务器","email.smtp_port":"邮件端口",
+    "email.username":"邮件账号","email.authcode":"邮件授权码","email.from_addr":"发件人","email.to_addrs":"收件人"};
+  if (result?.code === "validation_failed") {
+    const fields = Object.keys(result.fields || {}).map(key => labels[key]).filter(Boolean);
+    return fields.length ? "请检查或补充：" + fields.join("、") : "请检查设置字段";
+  }
+  if (result?.code === "execution_handover_required") return "本机仍有缓存订阅，暂不能安全切换执行位置";
+  if (result?.code === "remote_busy") return "连接正在使用或切换，请稍后重试";
+  return fallback;
+}
+
+function renderRemoteStatus(rm) {
+  REMOTE_ON = !!rm.enabled;
+  $("remoteBox").innerHTML = `<div class="banner info">执行位置：<b>${REMOTE_ON ? "服务器" : "本机"}</b>` +
+    (REMOTE_ON ? (rm.agent_ok === true ? " · 服务器代理在线" : " · 连接状态待确认") : " · 本机调度器执行") + '</div>';
+  const labels = {host:"服务器地址",user:"登录用户",key:"私钥路径",ssh_port:"SSH 端口",local_port:"转发端口"};
+  const inputs = {host:"rmHost",user:"rmUser",key:"rmKey",ssh_port:"rmSshPort",local_port:"rmLocalPort"};
+  $("remoteFieldsStatus").textContent = Object.entries(labels).map(([key,label]) => {
+    const state = rm.fields?.[key] || {};
+    $(inputs[key]).disabled = state.editable === false;
+    return `${label}：${state.configured ? "已配置" : "未配置"}${state.source === "env" ? "（环境变量，只读）" : ""}`;
+  }).join(" · ");
+}
+
+function markSettingsUnavailable() {
+  $("settingsConnectionStatus").textContent = "无法取得最新设置状态，请检查网络后重试。当前执行位置尚未确认。";
+  $("settingsConnectionStatus").style.display = "block";
+  $("remoteBox").textContent = "执行位置暂不可确认";
+}
+
+async function settingsRequest(path, options) {
+  try { return await api(path, options); }
+  catch { return {ok:false, error:"网络不可用，操作结果待确认，请检查连接"}; }
+}
+
+function setSettingsStatus(message, kind = "info") {
+  const el = $("settingsActionStatus");
+  el.textContent = message;
+  el.className = "banner " + kind;
+  el.style.display = "block";
+}
+
+$("notifyForm").addEventListener("input", () => { notifyFormDirty = true; notifyEditVersion++; });
+$("notifyForm").addEventListener("change", () => { notifyFormDirty = true; notifyEditVersion++; });
+
+function notifyFieldHtml(channel, field, label, row) {
+  const isBool = field === "enabled" || field === "use_ssl";
+  const fromEnv = row[field + "__source"] === "env";
+  const dis = fromEnv || row[field + "__editable"] === false ? "disabled" : "";
+  const id = `nf_${channel}_${field}`;
+  const source = fromEnv ? "环境变量，只读" : "可编辑";
+  const configured = row[field + "__set"] ? "已配置" : "未配置";
+  if (isBool) {
+    return `<label class="muted" style="display:flex;gap:6px;align-items:center;margin-top:6px">
+      <input type="checkbox" id="${id}" ${row[field] ? "checked" : ""} ${dis}> ${label}（${source}）</label>`;
+  }
+  const secret = field === "token" || field === "authcode";
+  const type = secret ? "password" : field === "smtp_port" ? "number" : "text";
+  const hints = {token:"请输入通知密钥",authcode:"请输入邮件授权码",smtp_host:"请输入 SMTP 服务器",
+    smtp_port:"请输入端口",username:"请输入邮件账号",from_addr:"请输入发件人",to_addrs:"请输入收件人"};
+  return `<label class="muted" for="${id}" style="display:block;margin-top:6px">${label}（${configured}，${source}）</label>
+    <input type="${type}" id="${id}" value="" placeholder="${hints[field]}" autocomplete="off" ${dis}
+      ${type === "number" ? 'min="1" max="65535"' : ''}>`;
+}
+
+function renderNotifyForm() {
+  const ch = (NOTIFY_CFG && NOTIFY_CFG.channels) || {};
+  if (!Object.keys(ch).length) {
+    $("notifyForm").innerHTML = '<div class="muted">还没有配置。填写下面的字段后保存即可。</div>';
+  }
+  const names = ["pushplus", "email"];
+  const label = { pushplus: "PushPlus（微信推送）", email: "邮件（SMTP）" };
+  $("notifyForm").innerHTML = names.map(n => {
+    const row = ch[n] || {};
+    return `<div class="card"><div class="title">${label[n]}</div>
+      ${NOTIFY_FIELDS[n].map(([f, l]) => notifyFieldHtml(n, f, l, row)).join("")}
+    </div>`;
+  }).join("");
+}
+
+async function loadNotifyConfig({signal} = {}) {
+  const sequence = ++NOTIFY_SEQUENCE;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MANUAL_REFRESH_TIMEOUT);
+  let r;
+  try {
+    r = await api("/api/notify/config", {signal:signal || controller.signal});
+  } catch {
+    r = {ok:false};
+  } finally { clearTimeout(timeout); }
+  if (sequence !== NOTIFY_SEQUENCE || signal?.aborted) return;
+  if (!r?.ok) {
+    $("notifyBox").innerHTML = '<div class="banner err">无法取得最新通知设置，请检查网络后重试。已输入内容保留。</div>';
+    return;
+  }
+  NOTIFY_CFG = r;
+  renderNotifySummary(r);
+  if (!notifyFormDirty) renderNotifyForm();
+}
+
+function renderNotifySummary(r) {
+  const ch = r.channels || {};
+  $("notifyBox").innerHTML = `<div class="banner info">` + ["pushplus", "email"].map(name =>
+    `${name === "pushplus" ? "PushPlus" : "邮件"}：${ch[name]?.enabled ? "已启用" : "未启用"}`
+  ).join(" · ") + '</div>';
+}
+
+async function saveNotifyConfig() {
+  if ($("btnNotifySave").disabled) return;
+  const version = notifyEditVersion;
+  const ch = {};
+  for (const n of ["pushplus", "email"]) {
+    const row = {};
+    for (const [f] of NOTIFY_FIELDS[n]) {
+      const el = document.getElementById(`nf_${n}_${f}`);
+      if (!el || el.disabled) continue;          // 环境变量提供的字段不改
+      if (el.type === "checkbox") row[f] = el.checked;
+      else if (el.value.trim() !== "") row[f] = el.value.trim();   // 空 = 不修改
+    }
+    ch[n] = row;
+  }
+  $("btnNotifySave").textContent = "保存中…";
+  $("btnNotifySave").disabled = true;
+  try {
+    const r = await api("/api/notify/config", { method: "POST", body: JSON.stringify({ channels: ch }) });
+    setSettingsStatus(r.ok ? "通知配置已保存" : settingsMessage(r, "通知配置保存未确认，请检查配置或网络"), r.ok ? "ok" : "err");
+    if (r.ok) {
+      NOTIFY_SEQUENCE++; NOTIFY_CFG = r;
+      renderNotifySummary(r);
+      if (version === notifyEditVersion) { notifyFormDirty = false; renderNotifyForm(); }
+    }
+  } catch { setSettingsStatus("网络不可用，通知配置未确认保存，请检查网络。", "err"); }
+  finally { $("btnNotifySave").textContent = "保存"; $("btnNotifySave").disabled = false; }
+}
+
+async function testNotify() {
+  // 会真的发一条消息，防连点
+  if ($("btnNotifyTest").disabled) return;
+  $("btnNotifyTest").textContent = "发送中…";
+  $("btnNotifyTest").disabled = true;
+  let r;
+  try { r = await api("/api/notify/test", { method: "POST" }); }
+  catch { r = {ok:false, error:"网络不可用，发送结果待确认"}; }
+  $("btnNotifyTest").textContent = "发送测试通知";
+  $("btnNotifyTest").disabled = false;
+  if (r.ok) {
+    setSettingsStatus("测试通知已发送：" + (r.results || []).map(x => `${x.channel === "email" ? "邮件" : x.channel === "pushplus" ? "PushPlus" : "通知"}=${x.ok ? "成功" : "失败"}`).join(" "), "ok");
+  } else {
+    setSettingsStatus("测试发送失败：" + "请检查通知配置或网络，发送结果待确认", "err");
+  }
+}
+
+
+// 本工具无法处理的赛事状态，一律不显示、也不给开关：
+//   赛事中（进不去）/ 已结束（没意义）/ 已取消（已失效）
+const HIDDEN_GROUPS = new Set(["ended", "cancelled", "running"]);
+
+// 「已订阅 / 报名」只看**当前所选地区** + 订阅集合。
+// TOURS 本身就是当前地区的列表，MINE 是当前账号的订阅；两者一交即得。
+//
+// 不再调用 /api/my_tournaments —— 它返回跨地区的**全量在册记录**，
+// 用户明确要求去掉（"之前的我的赛事相当于删去"）。
+// 后端接口保留不动（别处可能仍需要），只是本页不再使用。
+// 「已订阅 / 报名」的判定。**两个区共用这一个函数**——一个用它、一个用它的否定，
+// 于是两区天然互斥：不可能出现"两边都显示"，也不可能"两边都不显示"。
+//
+// 只用**服务端读数**（TOURS 的 group + MINE），刻意不掺本地乐观标记（ENROLLED）：
+// 掺进来会让赛事在提交成功后立刻跳区，而服务器若晚一拍又会跳回去——正是之前
+// 反复出现的"状态不稳、容易误点"。跳区交给 reloadAll() 后的自然刷新。
+function isMineOrSubscribed(t) {
+  return t.group === "mine" || MINE.has(String(t.tournament_id));
+}
+
+// ================================================================== 列表分区
+// 分区判定 + 两个区的渲染，**只有这一处声明**。
+//
+// 为什么收敛：此前 renderList() 与 renderMyList() 各自遍历 TOURS、各自写一套
+// 分区判定，于是反复出现**同一类**缺陷：
+//   ① 「立即报名」点后回退     —— 数据变了，按钮没跟着重画
+//   ② 「已订阅 / 报名」区恒为空 —— TOURS 更新了，该区没被通知重画
+//   ③ 两区未互斥、按钮分叉     —— 同一状态，两个区各写一套判定
+// 现在：分区用 pick()、按钮用 actionHtml()、两区由 renderSections() 一起画。
+//   **新增一个分区只需在 SECTIONS 里加一条**，不必再复制遍历/判定/按钮逻辑。
+//
+// 关键取舍：pick() 只用**服务端读数**（t.group === "mine" || MINE.has(tid)），
+// **刻意不掺本地乐观标记 ENROLLED** —— 掺进来会让赛事在提交成功后立刻跳区、
+// 服务器晚一拍又跳回，正是之前反复出现的"状态不稳"。
+//
+// 另注：这两个区是**互斥**的（一个用 isMineOrSubscribed 的肯定、另一个用否定），
+// 所以"交集为空、并集为全部"是构造性保证，不依赖两处条件各写一遍。
+
+// 紧凑卡片：「已订阅 / 报名」区用
+function cardMine(t) {
+  const tid = String(t.tournament_id);
+  const subscribed = MINE.has(tid);
+  const picked = PICK_TOURS.has(tid);
+  return `
+    <div class="card">
+      <div class="row" style="align-items:flex-start">
+        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与一键报名">
+        <div style="flex:1;min-width:0">
+          <div class="title">${esc(t.name)}
+            <span class="tag g-${t.group}">${esc(t.status)}</span>
+            ${subscribed ? '<span class="tag g-mine">已订阅</span>' : ""}
+          </div>
+          <div class="muted">主办方：${esc(t.org_name || "—")}${t.rule_name ? ` · ${esc(t.rule_name)}` : ""} · id=${esc(t.tournament_id)}</div>
+          <div class="muted">比赛开始：${esc(t.start_time || "—")} · ${feeHtml(t.fee)}</div>
+          ${t.location_detail ? `<div class="muted">地点：${esc(t.location_area)} ${esc(t.location_detail)}</div>` : ""}
+        </div>
+        ${actionHtml(t)}
+      </div>
+    </div>`;
+}
+
+// 完整卡片：「可订阅 / 报名」区用
+function cardOpen(t) {
+  const cnt = (t.player_num != null)
+    ? `<b>${t.player_num}</b>/${t.max_player_number}` : `<span class="muted">—</span>`;
+  // 时间提示。窗口**未开放**时优先提示——此时服务端状态可能仍是「可报名」
+  // （每日时段型在窗口外也返回「可报名」），若照旧显示"报名进行中"会误导用户。
+  let signupLine;
+  if (t.is_open === false) {
+    signupLine = `<div class="hi">报名未开始：${esc(t.window || "—")}${
+      t.opens_at ? `（下次开放 ${esc(t.opens_at)}）` : ""}</div>`;
+  } else if (t.group === "bookable") {
+    signupLine = `<div class="hi">报名开始：${esc(t.signup_time || "—")}${t.signup_start_time ? `（每日 ${esc(t.signup_start_time)}~${esc(t.signup_end_time)}）` : ""}</div>`;
+  } else if (t.group === "open") {
+    signupLine = `<div class="muted">报名进行中${t.signup_time ? `（自 ${esc(t.signup_time)}）` : ""}</div>`;
+  } else {
+    signupLine = `<div class="muted">报名开始：${esc(t.signup_time || "—")}</div>`;
+  }
+  const mine = MINE.has(String(t.tournament_id));
+  const picked = PICK_TOURS.has(String(t.tournament_id));
+  return `
+    <div class="card">
+      <div class="row" style="align-items:flex-start">
+        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与一键报名">
+        <div style="flex:1;min-width:0">
+          <div class="title">${esc(t.name)}
+            <span class="tag g-${t.group}">${esc(t.status)}</span>
+            ${t.cls_label ? `<span class="tag cls-${t.cls}">${esc(t.cls_label)}</span>` : ""}
+            ${mine ? '<span class="tag g-mine">已订阅</span>' : ""}
+          </div>
+          <div class="muted">
+            主办方：${esc(t.org_name || "—")}${t.type ? ` · ${esc(t.type)}` : ""}${t.rule_name ? ` · ${esc(t.rule_name)}` : ""}
+          </div>
+          <div class="muted">
+            报名人数：${cnt}
+            · ${feeHtml(t.fee)}
+            · id=${t.tournament_id}
+          </div>
+          <div class="muted">比赛开始：${esc(t.start_time || "—")}${t.checkin_time ? ` · 签到：${esc(t.checkin_time)}` : ""}</div>
+          ${signupLine}
+          ${t.location_detail ? `<div class="muted">地点：${esc(t.location_area)} ${esc(t.location_detail)}</div>` : ""}
+        </div>
+        ${actionHtml(t)}
+      </div>
+    </div>`;
+}
+
+// 分区声明表。**加一个新分区 = 加一条。**
+const SECTIONS = [
+  {
+    key: "open",
+    listId: "tourList",
+    infoId: "listInfo",
+    // 只放**未订阅且未报名**的（isMineOrSubscribed 的否定）
+    pick: t => !isMineOrSubscribed(t),
+    card: cardOpen,
+    emptyHtml: '<div class="muted">没有赛事</div>',
+    info: (rows, all) => `可订阅 / 报名 ${rows.length} 场（共 ${all} 场；`
+      + `已订阅、已报名或不可处理的 ${all - rows.length} 场在下方或已隐藏）`,
+  },
+  {
+    key: "mine",
+    listId: "myList",
+    infoId: "myInfo",
+    // 只放**已订阅或已报名**的
+    pick: t => isMineOrSubscribed(t),
+    card: cardMine,
+    // 空状态**只在 info 行说明一次**（带地区前缀）——这里再贴一句就会出现
+    // 先前那样"同一句提示出现两次"。
+    emptyHtml: "",
+    info: (rows, all, area) => {
+      if (!rows.length) return `${area}：当前地区没有已订阅或已报名的赛事`;
+      const enrolled = rows.filter(t => t.group === "mine").length;
+      return `${area}：已报名 ${enrolled} 场 · 已订阅待报名 ${rows.length - enrolled} 场`;
+    },
+  },
+];
+
+// 统一渲染入口：所有分区一起画。
+// 为什么"一起画"而不是各画各的：bug ② 的成因正是"某个区没被通知重画"。
+// 两个区共用同一份 TOURS，一起画是幂等的，代价可忽略。
+function renderSections() {
+  const hide = hiddenGroups();
+  let area = "";
+  try { area = currentArea(); } catch (_) { area = ""; }
+  for (const s of SECTIONS) {
+    const rows = TOURS.filter(t => !hide.has(t.group) && s.pick(t));
+    $(s.infoId).textContent = tournamentQueryError || s.info(rows, TOURS.length, area);
+    $(s.listId).innerHTML = rows.map(s.card).join("") || (tournamentQueryError ? "" : s.emptyHtml);
+  }
+  updateBatchButton();
+}
+
+// 这两个名字保留（多处调用），但**都走统一入口**——
+// 于是"只重画了一个区"这类缺陷在结构上不可能再发生。
+function renderList() { renderSections(); }
+function renderMyList() { renderSections(); }
+
+// 调用点保持不变（refresh / reloadAll / 切换账号都会调它），
+// 但不再发请求：TOURS 与 MINE 已在 refresh() 里更新过。
+async function loadMyTournaments() { renderMyList(); }
+
+function feeHtml(fee) {
+  const v = Number(fee || 0);
+  if (!v) return '<span class="free">免费</span>';
+  return `<span class="fee">报名费 ${v} 元</span>`;
+}
+
+function hiddenGroups() {
+  // 固定隐藏集合：不再有任何开关（赛事中/已结束/已取消本工具都无法处理）
+  return HIDDEN_GROUPS;
+}
+
+// ------------------------------------------------------------------ 乐观更新
+// 问题（真机实测）：点「订阅 / 立即报名」后，界面要等 reloadAll() 的三次串行
+// 网络往返（state → tournaments → my_tournaments）才变化，其中 tournaments
+// 还要补名额数据、很慢。这段时间里界面停在旧状态，用户以为没点上就再点一次；
+// 而列表一旦重排（赛事从 open 组移到 mine 组），卡片会位移，于是误点到别的赛事。
+//
+// 对策：
+//   1) 点击后**立刻**把该卡片上的按钮换成「处理中…」（只重画那一个按钮，
+//      不触碰其余 DOM → 列表不重排、不位移）
+//   2) 按钮用 .act 固定最小宽度 → 文案在「订阅/取消订阅/处理中…」间切换时不改宽度
+//   3) PENDING 记录未确认的操作：这期间 2 秒轮询 / 后台重画不得把它覆盖回去
+//   4) 失败则回滚（按钮回到操作前的样子）并明确提示
+const PENDING = new Map();   // tid -> "subscribe" | "unsub" | "enroll" | "cancel"
+// 两个页签共享在途订阅操作。切换账号时也保留，直到对应请求结束。
+const SUBSCRIPTION_BUSY = new Set();
+
+function subscriptionKey(accountId, tid) { return `${accountId}|${tid}`; }
+
+function setSubscriptionBusy(accountId, tid, busy) {
+  const key = subscriptionKey(accountId, tid);
+  if (busy) {
+    if (SUBSCRIPTION_BUSY.has(key)) return false;
+    SUBSCRIPTION_BUSY.add(key);
+  } else {
+    SUBSCRIPTION_BUSY.delete(key);
+  }
+  subscriptionView.updateUnsubscribeButton(key);
+  if (accountId === ACCOUNT_ID) updateAction(tid);
+  return true;
+}
+
+// 刚被服务器确认过的订阅状态 + 一个短暂宽限期。
+// 为什么需要：确认之后我们还会 reloadAll() 再去问一次服务器（远端模式下订阅
+// 存在服务器上）。万一那一次读到的状态比写入晚一拍，按钮就会「变过去又跳回来」——
+// 正是用户抱怨的"状态不稳、容易误点"。宽限期内以本地为准，服务器一旦达成一致
+// 或超过宽限期就让服务器说了算。
+const CONFIRMED = new Map();          // tid -> { want: bool, until: ms }
+const CONFIRM_GRACE_MS = 15000;
+
+function confirmState(tid, want) {
+  CONFIRMED.set(String(tid), { want: !!want, until: Date.now() + CONFIRM_GRACE_MS });
+}
+
+function confirmUnsubscription(tid) {
+  MINE.delete(tid);
+  confirmState(tid, false);
+}
+
+function removeConfirmedSubscription(accountId, tid) {
+  // 取消前发出的状态请求可能仍在路上，不能让旧快照恢复已移除的订阅。
+  SETTLED_REFRESH_SEQUENCE = ++REFRESH_SEQUENCE;
+  subscriptionView.removeSubscription(accountId, subscriptionKey(accountId, tid));
+}
+
+// 「已报名」是**另一条状态维度**，不能用 MINE 表达：MINE 表示"订阅"，
+// 而报名成功后按钮要变成「取消报名」，依据是列表数据里的 group（"mine"）。
+//
+// 但列表数据来自 /api/tournaments，服务端状态会晚一拍：远端模式下报名实际
+// 在服务器上执行，列表要过隧道再回来。实测缺陷：报名成功后 clearPending()
+// 用**尚未刷新**的 TOURS 重画按钮 → 又变回「立即报名」，用户以为没点上而
+// 重复点击（截图里同时出现绿色「已是已报名状态」横幅 + 「立即报名」按钮）。
+//
+// 所以本地要立刻落一个"已报名"标记，并给宽限期，等服务器读数追上来。
+// want=true 表示刚报名成功（强制显示已报名态），want=false 表示刚取消。
+const ENROLLED = new Map();           // tid -> { want: bool, until: ms }
+// 给得比订阅宽：报名要经隧道到服务器、再上报，链路更长。
+// 25000 不够——实测把本地标记清掉后按钮会退回「立即报名」。报名接口返回
+// ok 是**权威结论**（服务器已经接受了这次报名），而列表数据只是**滞后的二手视图**，
+// 所以本地要敢于在更长时间内以自己为准；服务器一旦读数一致就立刻交给它
+// （reconcileEnrolled），不会真的拖满。
+const ENROLL_GRACE_MS = 120000;
+
+function confirmEnroll(tid, want) {
+  ENROLLED.set(String(tid), { want: !!want, until: Date.now() + ENROLL_GRACE_MS });
+}
+
+// 服务器读数与本地标记一致时，立刻撤掉本地覆盖（让它尽早回归"服务器说了算"）。
+// 在列表数据刷新后调用。返回是否仍有未对账的标记。
+function reconcileEnrolled() {
+  const now = Date.now();
+  for (const [tid, rec] of Array.from(ENROLLED)) {
+    if (now > rec.until) { ENROLLED.delete(tid); continue; }   // 宽限期到，交给服务器
+    const t = TOURS.find(x => String(x.tournament_id) === tid);
+    if (!t) continue;                                          // 本次列表没这场，保留标记
+    const serverMine = groupOf(t.status) === "mine";
+    if (serverMine === rec.want) ENROLLED.delete(tid);          // 已一致
+  }
+}
+
+function actionHtml(t) {
+  // 按状态决定动作：
+  //   可报名 + 窗口已开 → 直接报名（当场完成，不进订阅列表）
+  //   可报名 + 窗口未开 → 订阅（此时直接报名**必然被拒**，见下方注释）
+  //   已报满/可预约等   → 订阅（交给调度器在开放时自动报名）
+  //   已是我的          → 只显示状态
+  const tid = String(t.tournament_id);
+  const id = ` id="act-${tid}"`;
+  if (PENDING.has(tid) || SUBSCRIPTION_BUSY.has(subscriptionKey(ACCOUNT_ID, tid))) {
+    // 处理中：就地换文案，靠 .act 的固定最小宽度保证不位移
+    return `<button class="small act"${id} disabled>处理中…</button>`;
+  }
+  if (eventActionsUnverified()) {
+    return `<button class="small act"${id} disabled>待核对</button>`;
+  }
+  // 本地刚确认的报名状态**优先于**（可能晚一拍的）列表读数：
+  // 报名成功后立刻显示已报名态，不再退回去——这是用户实测的缺陷。
+  const enr = ENROLLED.get(tid);
+  const enrActive = !!enr && Date.now() <= enr.until;
+  const forceEnrolled = enrActive && enr.want;
+  const forceNotEnrolled = enrActive && !enr.want;
+  if (forceEnrolled) {
+    return `<button class="small act"${id} onclick="cancelEnroll('${tid}','${esc(t.name)}','已报名')">取消报名</button>`;
+  }
+  const mine = MINE.has(tid);
+  if (mine) {
+    return `<button class="small act"${id} onclick="unsub('${tid}')">取消订阅</button>`;
+  }
+  if (t.group === "open" && t.is_open === false) {
+    // 服务端的「可报名」只表示"你与这场赛事的关系"，与窗口是否到点无关：
+    // 每日时段型（如大奖赛 16:00~23:59）在窗口外同样返回「可报名」，此时提交
+    // 会被上游以"非报名时间"拒绝。所以这里改为引导订阅，由调度器在窗口开放时
+    // 自动抢位——而不是让用户去点一个注定失败的动作。
+    //
+    // 必须用 === false：is_open 为 null/undefined 表示"窗口信息未取到"
+    // （该赛事未被 enrich 覆盖），此时保持原行为，不能擅自降级成订阅。
+    return `<button class="small act primary"${id} onclick="subscribe('${tid}')">订阅</button>`;
+  }
+  if (t.group === "open") {
+    return `<button class="small act primary"${id} onclick="enroll('${tid}')">立即报名</button>`;
+  }
+  if (t.group === "mine" && !forceNotEnrolled) {
+    // 已报名/已预约：可取消，且必须二次确认（不可逆操作）
+    const label = t.status === "已预约" ? "取消预约" : "取消报名";
+    return `<button class="small act"${id} onclick="cancelEnroll('${tid}','${esc(t.name)}','${esc(t.status)}')">${label}</button>`;
+  }
+  if (t.group === "ended" || t.group === "cancelled" || t.group === "running") {
+    return `<span class="muted"${id}>—</span>`;
+  }
+  return `<button class="small act primary"${id} onclick="subscribe('${tid}')">订阅</button>`;
+}
+
+// 只重画一张卡片里的动作按钮：DOM 其余部分原样保留，
+// 因此列表顺序与各卡片位置**不会改变**，不存在"点完位移导致误点"。
+function updateAction(tid) {
+  const key = String(tid);
+  const el = document.getElementById("act-" + key);
+  if (!el) return;
+  const t = TOURS.find(x => String(x.tournament_id) === key);
+  if (!t) return;
+  const box = document.createElement("div");
+  box.innerHTML = actionHtml(t).trim();
+  const fresh = box.firstElementChild;
+  if (fresh) el.replaceWith(fresh);
+}
+
+function setPending(tid, kind) { PENDING.set(String(tid), kind); updateAction(tid); }
+function clearPending(tid) { PENDING.delete(String(tid)); updateAction(tid); }
+
+// 「可订阅 / 报名」区的渲染已上移到统一入口（见上方 SECTIONS / renderSections）。
+// 卡片模板在 cardOpen()，分区判定在 SECTIONS[0].pick。
+//
+// 这里**刻意不再定义 renderList()** —— 函数声明会被提升，若在此处再写一份，
+// 就会覆盖上面的统一入口，把刚消除的"两区各画各的"缺陷重新引入。
+
+const MANUAL_REFRESH_TIMEOUT = 30000;
+
+async function loadAreas() {
+  // The shared request can outlive one gesture, but must release its slot after a timeout.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MANUAL_REFRESH_TIMEOUT);
+  let r;
+  try {
+    r = await api("/api/areas", {signal:controller.signal});
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!r?.ok || !r.provinces?.length) return;
+  AREAS = r.provinces;
+  const pv = $("province");
+  pv.innerHTML = AREAS.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  // 默认选中广东省（有赛事且是本项目的主要地区）
+  const gi = AREAS.findIndex(p => p.name === "广东省");
+  pv.selectedIndex = gi >= 0 ? gi : 0;
+  fillCities("广州市");
+}
+
+async function queryEvents(signal) {
+  if (AREAS.length) return loadTournaments(signal);
+  const visit = pageVisit;
+  const sequence = beginTournamentValidation();
+  if (!areasRequest) {
+    areasRequest = loadAreas().catch(() => {}).finally(() => { areasRequest = null; });
+  }
+  await areasRequest;
+  if (signal?.aborted || visit !== pageVisit || sequence !== TOUR_SEQUENCE) return;
+  if (AREAS.length) return loadTournaments(signal);
+  $("listInfo").textContent = "暂时无法加载省市，请重试";
+}
+
+function fillCities(prefer) {
+  const prov = AREAS.find(p => p.name === $("province").value);
+  const cities = (prov && prov.cities) || [];
+  const ct = $("city");
+  ct.innerHTML = cities.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  if (prefer && cities.includes(prefer)) ct.value = prefer;
+  else if (cities.length) ct.selectedIndex = 0;
+}
+
+function currentArea() {
+  return $("province").value + "-" + $("city").value;
+}
+
+function eventActionsUnverified() {
+  return tournamentsUnverified || requiredEventStateSequence != null;
+}
+
+function disableTournamentActions() {
+  document.querySelectorAll("#tourList button.act, #myList button.act").forEach(button => {
+    if (button.disabled) return;
+    button.disabled = true;
+    button.textContent = "待核对";
+  });
+  updateBatchButton();
+}
+
+function requireEventState(sequence) {
+  requiredEventStateSequence = Math.max(requiredEventStateSequence ?? 0, sequence);
+  disableTournamentActions();
+}
+
+function beginTournamentValidation() {
+  tournamentsUnverified = true;
+  disableTournamentActions();
+  return ++TOUR_SEQUENCE;
+}
+
+async function loadTournaments(signal) {
+  if (!$("province").value || !$("city").value) {
+    $("listInfo").textContent = "请先选择省市";
+    return;
+  }
+  const area = currentArea();
+  const visit = pageVisit;
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH, sequence = beginTournamentValidation();
+  $("listInfo").textContent = `查询 ${area} 中（正在补充报名人数，稍候）…`;
+  const r = await api("/api/tournaments?area=" + encodeURIComponent(area), {signal}).catch(netErr);
+  if (signal?.aborted && r.ok) return;
+  if (visit !== pageVisit || accountId !== ACCOUNT_ID || epoch !== ACCOUNT_EPOCH ||
+      sequence !== TOUR_SEQUENCE || area !== currentArea()) return;
+  if (r.ok && r.account_id !== accountId) return;
+  if (!r.ok) {
+    // 清空陈旧卡片，暂时禁用批量报名，保留勾选供重试。
+    // 列表缩短前记下阅读位置，避免浏览器把保存值限制在空列表的底部。
+    discardMovedEventsScroll();
+    const scrollY = window.scrollY;
+    tournamentQueryError = r.error || "查询失败";
+    TOURS = [];
+    renderSections();
+    if (currentPage === "events" && window.scrollY < scrollY) {
+      pendingEventsScroll = {offset: pendingEventsScroll?.offset ?? scrollY, observed: window.scrollY};
+    }
+    return;
+  }
+  tournamentQueryError = "";
+  TOURS = r.items || [];
+  const hide = hiddenGroups();
+  const available = new Set(TOURS.filter(t => !hide.has(t.group)).map(t => String(t.tournament_id)));
+  for (const id of PICK_TOURS) if (!available.has(id)) PICK_TOURS.delete(id);
+  tournamentsUnverified = false;
+  discardMovedEventsScroll();
+  reconcileEnrolled();   // 服务器读数已追上时撤掉本地覆盖，尽早"服务器说了算"
+  expandList();
+  renderList();
+  // **两个区都由同一份 TOURS 驱动，必须一起重画。**
+  // 早先这里只调 renderList()，「已订阅 / 报名」区就只在别处被调用时才更新：
+  // 页面初始化时 loadMyTournaments() 抢在 TOURS 拿到数据之前跑了一次（那时 TOURS
+  // 还是空数组），此后 TOURS 更新却没人通知它 —— 于是主列表正常、副列表永远为空。
+  renderMyList();
+  if (currentPage === "events" && pendingEventsScroll != null) {
+    window.scrollTo(0, pendingEventsScroll.offset);
+    pendingEventsScroll = null;
+  }
+}
+
+async function reloadAll() {
+  // 必须"先取状态、再重画列表"：列表里的「已订阅」标记来自 /api/state 的 mine，
+  // 顺序反了标记就会停在操作前的状态。
+  const visit = pageVisit;
+  await refresh();
+  if (visit === pageVisit && (currentPage === "events" || !currentPage)) await loadTournaments();
+}
+
+// 把「发请求 → 收尾」统一成一个形状：
+//   api() 在网络错误时**抛异常**（不是返回对象），若不用 try/catch 包住，
+//   后面的 clearPending() 就不会执行，按钮会永远卡在「处理中…」。
+// 所以这里统一兜住异常，并保证无论成败都清掉待确认状态。
+function netErr(e) { return { ok: false, error: "网络异常（" + (e && e.message ? e.message : e) + "）" }; }
+
+async function enroll(tid) {
+  if (eventActionsUnverified()) return;
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
+  // 直接报名（仅用于「可报名」的赛事）：当场提交并复核，结果直接告知。
+  // 不弹确认——报名本身可逆（随时能取消），弹窗只是碍事。
+  //
+  // 点击后立刻把该按钮换成「处理中…」（只重画这一个按钮，列表不重排），
+  // 不等服务器往返——否则这几秒里界面停在旧状态，用户会重复点或点到别处。
+  setPending(tid, "enroll");
+  setStatus("正在报名…", "info");
+  let r;
+  try {
+    r = await api("/api/enroll", { method: "POST", body: JSON.stringify({ tournament_id: tid }) });
+  } catch (e) { r = netErr(e); }
+  if (accountId !== ACCOUNT_ID || epoch !== ACCOUNT_EPOCH) return;
+  // 抢在 clearPending() 之前落本地标记：clearPending 会立刻重画按钮，
+  // 而那时 TOURS 还是旧的（group 仍是 "open"）——不先落标记就会退回「立即报名」。
+  // 对「该账号已是已报名状态」这种幂等返回同样成立：r.ok 为真即视为已报名。
+  if (r.ok) confirmEnroll(tid, true);
+  clearPending(tid);
+  setStatus(r.ok ? (r.message || "报名成功") : ("报名未成功：" + (r.error || "未知原因")),
+            r.ok ? "ok" : "err");
+  try { await reloadAll(); } catch (e) { /* 状态已告知，刷新失败不覆盖提示 */ }
+}
+
+async function cancelEnroll(tid, name, status) {
+  if (eventActionsUnverified()) return;
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
+  // 取消报名/预约：不可逆，做一次明确确认（把后果写在同一条里）。
+  // 这是全页面唯一的确认窗——报名与订阅都不弹。
+  const act = status === "已预约" ? "取消预约" : "取消报名";
+  if (!confirm(`${act}？\n\n赛事：${name}\n当前状态：${status}\n\n` +
+               `确认后会立即提交到服务器，名额将释放，可能被他人占用。`)) return;
+  setPending(tid, "cancel");
+  setStatus(`正在${act}…`, "info");
+  let r;
+  try {
+    r = await api("/api/cancel", { method: "POST", body: JSON.stringify({ tournament_id: tid }) });
+  } catch (e) { r = netErr(e); }
+  if (accountId !== ACCOUNT_ID || epoch !== ACCOUNT_EPOCH) return;
+  // 同 enroll()：先落本地标记再重画，否则取消成功后按钮会短暂停留在「取消报名」，
+  // 而列表数据晚一拍才变成「可报名」。
+  if (r.ok) confirmEnroll(tid, false);
+  clearPending(tid);
+  setStatus(r.ok ? (r.message || `${act}成功`) : (`${act}未成功：` + (r.error || "未知原因")),
+            r.ok ? "ok" : "err");
+  try { await reloadAll(); } catch (e) { }
+}
+
+async function subscribe(tid) {
+  if (eventActionsUnverified()) return;
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
+  // 订阅：进入自动报名列表，本身无即时副作用，所以不弹确认。
+  const key = String(tid);
+  if (!setSubscriptionBusy(accountId, key, true)) return;
+  const wasSubscribed = MINE.has(key);
+  setPending(key, "subscribe");       // 立刻反馈，不等往返
+  let r;
+  try {
+    r = await api("/api/subscribe", { method: "POST", body: JSON.stringify({ tournament_id: tid }) });
+  } catch (e) { r = netErr(e); }
+  finally { setSubscriptionBusy(accountId, key, false); }
+  if (accountId !== ACCOUNT_ID || epoch !== ACCOUNT_EPOCH) return;
+  // 回显具体账号：远端模式下订阅由服务器代理执行，若不说清账号，
+  // 一旦归属错了很难察觉（实测踩过订阅被记到另一个账号名下）。
+  const who = r.account_id ? `「${accountLabel(r.account_id)}」` : "";
+  if (r.ok) {
+    MINE.add(key);                    // 落地：按钮变「取消订阅」
+    confirmState(key, true);          // 宽限期内不被晚一拍的服务器读数翻回去
+    setStatus(r.already ? `该赛事已由 ${who} 订阅（未做改动）` : `已用 ${who} 加入自动报名列表`, "ok");
+  } else {
+    if (wasSubscribed) MINE.add(key); else MINE.delete(key);
+    setStatus("订阅失败：" + (r.error || "未知原因"), "err");
+  }
+  clearPending(key);                  // 用更新后的 MINE 重画这一个按钮
+  try { await reloadAll(); } catch (e) { }
+}
+
+async function unsub(tid) {
+  if (eventActionsUnverified()) return;
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
+  // 取消的是"当前账号"对该赛事的订阅；其它账号的订阅不受影响。
+  const key = String(tid);
+  if (!setSubscriptionBusy(accountId, key, true)) return;
+  const wasSubscribed = MINE.has(key);
+  setPending(key, "unsub");
+  let r;
+  try {
+    r = await api("/api/unsubscribe", { method: "POST", body: JSON.stringify({ tournament_id: tid }) }).catch(netErr);
+    if (r.ok) removeConfirmedSubscription(accountId, key);
+  } finally { setSubscriptionBusy(accountId, key, false); }
+  if (accountId !== ACCOUNT_ID || epoch !== ACCOUNT_EPOCH) return;
+  if (!r.ok) {
+    if (wasSubscribed) MINE.add(key); else MINE.delete(key);
+    setStatus("取消订阅失败：" + (r.error || "未知原因"), "err");
+  } else {
+    confirmUnsubscription(key);      // 取消后不被晚一拍的读数翻回来
+    setStatus("已取消订阅", "ok");
+  }
+  clearPending(key);
+  try { await reloadAll(); } catch (e) { }
+}
+async function selectAcct(id) {
+  ACCOUNT_ID = id;
+  ACCOUNT_EPOCH++;
+  REFRESH_SEQUENCE++;
+  clearAccountView("正在切换账号…");
+  const result = await api("/api/account/select", {method:"POST", body:JSON.stringify({account_id:id})});
+  if (!result.ok) setStatus(result.error || "切换失败", "err");
+  await refresh();
+  await loadTournaments();
+}
+async function restoreAcct(id, version) {
+  if (!confirm(`恢复 UID ${id}？请登录该 UID 的官方账号；旧订阅不会自动恢复。`)) return;
+  await startLogin({restore_account_id:id, expected_version:version});
+}
+async function forgetAcct(id) {
+  const row = ACCOUNT_ROWS.get(id);
+  if (!row || !confirm(`删除 ${accountLabel(id)}？该账号订阅将停止，历史记录保留。`)) return;
+  const result = await api("/api/account/forget", {method:"POST", body:JSON.stringify({
+    account_id:id, expected_version:row.version, operation_id:crypto.randomUUID()
+  })});
+  if (!result.ok) { setStatus(result.error || "删除失败", "err"); return; }
+  if (ACCOUNT_ID === id) {
+    ACCOUNT_ID = null; ACCOUNT_EPOCH++; LAST_ACTIVE = null;
+    clearAccountView("账号已删除，正在重新读取账号列表…");
+  }
+  await refresh();
+}
+// ------------------------------------------------------------------ 网页 → 原生通道
+// 用**自定义 URL scheme**（sve://…）而不是 addJavascriptInterface：
+//   * 不必在 WebView 上暴露 Java 对象 → 没有 @JavascriptInterface 的注入面
+//   * 拦截点在 WebViewClient，只接受我们认识的固定 scheme，白名单天然成立
+//   * 网页侧只需一次 location 赋值，不依赖注入时机
+// 原生端注入 window.__SVE_APP__，供网页识别 App 环境。
+const NATIVE_SCHEME = "sve://";
+
+function inApp() { return !!window.__SVE_APP__; }
+function nativeCall(action) {
+  if (!inApp()) return false;
+  try { location.href = NATIVE_SCHEME + action; return true; } catch (_) { return false; }
+}
+
+async function startLogin(options = {}) {
+  // A fresh intent pins versions before opening the official login page. The same
+  // WebView cookies also carry it in installed APKs without changing their payload.
+  const intent = await api("/api/login/intent", {method:"POST", body:JSON.stringify(options)});
+  if (!intent.ok) { setStatus(intent.error || "无法发起登录", "err"); return; }
+  // ① App 内：交给原生登录页——它是唯一能读到 HttpOnly Cookie 的地方
+  if (nativeCall("login")) {
+    $("loginBox").innerHTML = '<div class="banner info">正在打开登录页…请在下方页面内完成登录（含验证码/滑块）。</div>';
+    return;
+  }
+  // ② 电脑客户端（本机有浏览器）：仍走服务端登录
+  $("loginBox").innerHTML = '<div class="banner info">正在尝试用本机浏览器登录…</div>';
+  const r = await api("/api/login/start", { method: "POST" });
+  if (!r.ok) {
+    // ③ 纯浏览器 + 无本机浏览器（例如直接打开服务器地址）：给出**可操作**提示，
+    //    不再抛"未找到 Chrome 或 Edge"这种实现细节
+    $("loginBox").innerHTML = `<div class="banner err">此环境无法新增账号</div>
+      <div class="muted" style="margin-top:6px">
+        新增账号需要在<b>手机 App</b> 内点击本按钮（App 会调起官方登录页），
+        或在<b>新版电脑客户端</b>明确登录后提交单个会话到本服务。
+      </div>`;
+  }
+  refresh();
+}
+
+$("btnLogin").onclick = () => startLogin();
+
+// ------------------------------------------------------------------ 批量报名
+// ⚠️ 这是本工具**唯一会真正改变账号状态**的功能，因此：
+//   * 点击后弹**二次确认**，逐条列出「哪个账号 → 哪场赛事」，让人看清再确认
+//   * 逐项汇总结果（成功 / 跳过（已报名）/ 失败+原因），**中途失败不中断其余**
+//   * 「已报名则跳过」的判定由**服务端**重新查详情得出，不依赖前端缓存
+const PICK_ACCTS = new Set();
+const PICK_TOURS = new Set();
+let batchRunning = false;
+let batchResultOpen = false;
+let batchDialogOrigin;
+
+function closeBatchResult() {
+  if (!batchResultOpen) return;
+  if (history.state?.batchResult === batchDialogOrigin.historyKey) {
+    if (!batchDialogOrigin.closing) {
+      batchDialogOrigin.closing = true;
+      history.back();
+    }
+    return;
+  }
+  dismissBatchResult();
+}
+
+function dismissBatchResult() {
+  if (!batchResultOpen) return;
+  batchResultOpen = false;
+  const dialog = $("batchDialog");
+  if (typeof dialog.close === "function") dialog.close();
+  else dialog.removeAttribute("open");
+  const origin = batchDialogOrigin;
+  for (const [element, inert] of origin.inert || []) element.inert = inert;
+  $("batchBackdrop").hidden = true;
+  document.body.style.overflow = origin.overflow;
+  updateBatchButton();
+  updateBackToTop();
+  const target = origin.focus?.isConnected && origin.focus !== document.body &&
+    !origin.focus.hidden && !origin.focus.disabled &&
+    (!origin.focus.getClientRects || origin.focus.getClientRects().length > 0)
+    ? origin.focus : $("appTitle");
+  target.focus({preventScroll:true});
+  if (origin.page === currentPage) window.scrollTo(0, origin.scroll);
+}
+
+function showBatchResult(rows) {
+  const counts = {ok:0, skip:0, fail:0, pending:0};
+  const labels = {ok:"成功", skip:"已报名，跳过", fail:"失败", pending:"待确认"};
+  for (const row of rows) counts[row.result]++;
+  $("batchSummary").textContent = `成功 ${counts.ok} · 跳过 ${counts.skip} · 失败 ${counts.fail} · 待确认 ${counts.pending}`;
+  $("batchDetails").innerHTML = (counts.pending
+    ? '<p class="hi">部分结果未取得，请先查询官方报名状态，勿直接重复提交。</p>' : '') +
+    rows.map(row => `<p>${esc(row.accountLabel)} → ${esc(row.tourName)}：${labels[row.result]}` +
+      `${row.reason ? '：' + esc(row.reason) : ''}</p>`).join('');
+  batchDialogOrigin = {focus:document.activeElement, scroll:window.scrollY,
+    page:currentPage, overflow:document.body.style.overflow, historyKey:crypto.randomUUID()};
+  batchResultOpen = true;
+  // Installed Android clients use WebView history for system Back.
+  history.pushState({...history.state, batchResult:batchDialogOrigin.historyKey}, "", location.href);
+  pullRefresh.cancelGesture();
+  const dialog = $("batchDialog");
+  if (typeof dialog.showModal === "function") dialog.showModal();
+  else {
+    dialog.classList.add("fallback");
+    dialog.setAttribute("open", "");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    batchDialogOrigin.inert = [...document.body.children]
+      .filter(element => element !== dialog && element !== $("batchBackdrop"))
+      .map(element => [element, element.inert]);
+    for (const [element] of batchDialogOrigin.inert) element.inert = true;
+    $("batchBackdrop").hidden = false;
+  }
+  document.body.style.overflow = "hidden";
+  $("batchDetails").scrollTop = 0;
+  $("batchClose").focus({preventScroll:true});
+  updateBatchButton();
+  updateBackToTop();
+}
+
+$("batchClose").onclick = closeBatchResult;
+$("batchDialog").addEventListener("cancel", event => {
+  event.preventDefault();
+  closeBatchResult();
+});
+$("batchDialog").addEventListener("close", () => {
+  if (!$("batchDialog").open) closeBatchResult();
+});
+$("batchDialog").addEventListener("keydown", event => {
+  if (event.key === "Escape") { event.preventDefault(); closeBatchResult(); }
+  // Also contain keyboard focus in the fallback for older WebViews.
+  if (event.key === "Tab") {
+    event.preventDefault();
+    (document.activeElement === $("batchClose") ? $("batchDetails") : $("batchClose")).focus();
+  }
+});
+
+function hasBatchSelection() {
+  return currentPage === "events" && !menu.open && !batchResultOpen && PICK_ACCTS.size > 0 && PICK_TOURS.size > 0;
+}
+
+function updateBatchButton() {
+  const btn = $("btnBatch");
+  btn.hidden = !hasBatchSelection() || (!batchRunning && eventActionsUnverified());
+  btn.disabled = btn.hidden || batchRunning;
+  btn.textContent = batchRunning ? "报名\n中…" : "一键\n报名";
+  btn.setAttribute("aria-label", batchRunning ? "一键报名，提交中" : "一键报名");
+}
+
+document.addEventListener("change", (e) => {
+  const el = e.target;
+  if (!el || !el.classList || !el.classList.contains("pick")) return;
+  if (el.dataset.kind === "acct") {
+    el.checked ? PICK_ACCTS.add(el.dataset.id) : PICK_ACCTS.delete(el.dataset.id);
+  } else if (el.dataset.kind === "tour") {
+    el.checked ? PICK_TOURS.add(el.dataset.id) : PICK_TOURS.delete(el.dataset.id);
+  }
+  updateBatchButton();
+});
+
+function tourName(tid) {
+  const t = TOURS.find(x => String(x.tournament_id) === String(tid));
+  return t ? t.name : String(tid);
+}
+
+async function batchEnroll() {
+  if (batchRunning || !hasBatchSelection() || eventActionsUnverified()) return;
+  const accts = [...PICK_ACCTS], tours = [...PICK_TOURS];
+  const tourNames = new Map(tours.map(id => [id, tourName(id)]));
+  const accountNames = new Map(accts.map(id => [id, accountLabel(id)]));
+  const snapshot = accts.flatMap(id => tours.map(tid => ({account_id:id, tournament_id:tid,
+    accountLabel:accountNames.get(id), tourName:tourNames.get(tid)})));
+  const count = accts.length * tours.length;
+
+  const pairs = accts.flatMap(id => tours.map(tid => `　· ${accountLabel(id)} → ${tourNames.get(tid)}`));
+  if (!confirm(
+    `即将执行批量报名\n\n` +
+    `${accts.length} 个账号 × ${tours.length} 场赛事 = ${count} 次提交\n\n` +
+    pairs.join("\n") +
+    `\n\n已报名的会自动跳过。确认执行？`
+  )) return;
+
+  const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
+  batchRunning = true;
+  updateBatchButton();
+  setStatus(`正在批量报名（最多 ${count} 次）…`, "info");
+  const controller = new AbortController();
+  let timeout;
+  try {
+    const r = await Promise.race([api("/api/batch_enroll", {
+      method: "POST",
+      body: JSON.stringify({ account_ids: accts, tournaments: tours }),
+      signal: controller.signal,
+    }).catch(() => null), new Promise(resolve => {
+      timeout = setTimeout(() => { controller.abort(); resolve(null); }, 120000);
+    })]);
+    const received = r?.ok && Array.isArray(r.results) ? r.results : [];
+    const requestError = r?.ok === false && typeof r.error === "string" ? r.error.trim() : "";
+    // Only these validation codes guarantee that no enrollment was attempted.
+    // Proxy errors (including timeouts) may arrive after a partial submission.
+    const rejection = requestError && ["batch_selection_required", "batch_limit_exceeded"].includes(r.code);
+    // Only an unambiguous response for a requested pair can settle that pair.
+    const rows = snapshot.map(pair => {
+      if (rejection) return {...pair, result:"fail", reason:`请求被拒绝：${requestError}`};
+      const matches = received.filter(row => row && String(row.account_id) === pair.account_id &&
+        String(row.tournament_id) === pair.tournament_id);
+      const row = matches.length === 1 ? matches[0] : null;
+      const result = row && ["ok", "skip", "fail"].includes(row.result) ? row.result : "pending";
+      return {...pair, result, reason:result === "fail" ? String(row.reason || "报名失败，未提供原因") :
+        result === "pending" ? (requestError || "未取得明确结果") : ""};
+    });
+    showBatchResult(rows);
+
+    // Uncheck successful events before releasing the submit lock or reloading the list.
+    if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) {
+      setStatus(`批量报名结果：${$("batchSummary").textContent}`,
+        rows.some(row => row.result === "fail" || row.result === "pending") ? "err" : "ok");
+      for (const row of rows) if (row.result === "ok") PICK_TOURS.delete(row.tournament_id);
+      document.querySelectorAll('input.pick[data-kind="tour"]:checked').forEach(input => {
+        input.checked = PICK_TOURS.has(input.dataset.id);
+      });
+    }
+  } finally {
+    clearTimeout(timeout);
+    batchRunning = false;
+    updateBatchButton();
+  }
+  if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) await reloadAll();
+}
+
+$("btnBatch").onclick = batchEnroll;
+$("btnLoad").onclick = () => queryEvents();
+function changeArea() {
+  pendingEventsScroll = null;
+  tournamentQueryError = "";
+  PICK_TOURS.clear();
+  TOURS = [];
+  renderSections();
+  return queryEvents();
+}
+$("province").onchange = () => { fillCities(); return changeArea(); };
+$("city").onchange = changeArea;
+$("btnPushAccounts").onclick = async () => {
+  $("btnPushAccounts").textContent = "比较中…";
+  $("btnPushAccounts").disabled = true;
+  const r = await settingsRequest("/api/remote/push_accounts", { method: "POST" });
+  if (r.ok) setSettingsStatus(`只读比较：本机 ${r.local_total} 个，服务器 ${r.total} 个；仅本机 ${(r.local_only||[]).length} 个，仅服务器 ${(r.remote_only||[]).length} 个，身份冲突 ${(r.conflicts||[]).length} 个。新增或更新会话请重新登录。`, "ok");
+  else setSettingsStatus(settingsMessage(r, "账号比较失败，请检查服务器连接"), "err");
+  $("btnPushAccounts").textContent = "比较两端账号";
+  $("btnPushAccounts").disabled = false;
+  refresh();
+};
+
+let remoteSettingsBusy = false;
+async function saveRemoteSettings(enabled) {
+  if (remoteSettingsBusy) return;
+  if (!enabled && !confirm("切回本机执行？服务器已有订阅仍会独立运行；存在缓存订阅时将拒绝切换。")) return;
+  const version = remoteEditVersion;
+  const body = {enabled};
+  if (enabled) {
+    const fields = {host:"rmHost",user:"rmUser",key:"rmKey",ssh_port:"rmSshPort",local_port:"rmLocalPort"};
+    for (const [field,id] of Object.entries(fields)) {
+      if (!$(id).disabled && $(id).value.trim()) body[field] = $(id).value.trim();
+    }
+  }
+  remoteSettingsBusy = true;
+  $("btnRemoteOn").disabled = $("btnRemoteOff").disabled = true;
+  try {
+    const r = await settingsRequest("/api/remote/config", {method:"POST",body:JSON.stringify(body)});
+    setSettingsStatus(r.ok ? (enabled ? "连接配置已保存，正在核对服务器状态" : "已切回本机执行") :
+      settingsMessage(r, "连接配置未生效，请检查连接或运行环境"), r.ok ? "ok" : "err");
+    if (r.ok && version === remoteEditVersion) for (const id of REMOTE_INPUTS) $(id).value = "";
+  } finally {
+    remoteSettingsBusy = false;
+    $("btnRemoteOn").disabled = $("btnRemoteOff").disabled = false;
+  }
+  await refresh();
+}
+$("btnRemoteOn").onclick = () => saveRemoteSettings(true);
+$("btnRemoteOff").onclick = () => saveRemoteSettings(false);
+
+$("notifyDetails").addEventListener("toggle", () => {
+  if (currentPage === "settings" && $("notifyDetails").open && !NOTIFY_CFG) loadNotifyConfig();
+});
+$("btnNotifySave").onclick = saveNotifyConfig;
+$("btnNotifyTest").onclick = testNotify;
+
+
+// One gesture controls the shared indicator and the active tab's existing refresh path.
+const pullRefresh = (() => {
+  const ptr = $("ptr");
+  const status = $("ptrStatus");
+  const threshold = 64;
+  let gesture;
+  let activeRefresh;
+
+  function draw(distance, state) {
+    ptr.style.setProperty("--ptr-distance", distance + "px");
+    if (state) ptr.dataset.state = state;
+    else delete ptr.dataset.state;
+    ptr.textContent = state === "ready" ? "↑" : state === "pulling" ? "↓" : "";
+  }
+
+  function cancelGesture() {
+    if (!gesture) return;
+    gesture = null;
+    draw(0);
+  }
+
+  function finish(run, message = "") {
+    if (activeRefresh !== run) return;
+    clearTimeout(run.timer);
+    activeRefresh = null;
+    draw(0);
+    status.textContent = message;
+  }
+
+  function cancel() {
+    cancelGesture();
+    if (!activeRefresh) return;
+    const run = activeRefresh;
+    run.controller.abort();
+    finish(run);
+  }
+
+  async function refreshTab() {
+    const visit = pageVisit;
+    const page = currentPage;
+    const controller = new AbortController();
+    const run = {controller};
+    activeRefresh = run;
+    draw(threshold, "busy");
+    status.textContent = "正在刷新";
+    run.timer = setTimeout(() => {
+      controller.abort();
+      finish(run, "刷新超时，请重试");
+    }, MANUAL_REFRESH_TIMEOUT);
+    let message = "";
+    try {
+      await refresh({signal:controller.signal, reloadEventsOnAccountChange:false});
+      if (!controller.signal.aborted && visit === pageVisit && page === "events") {
+        await queryEvents(controller.signal);
+      }
+      if (!controller.signal.aborted && visit === pageVisit && page === "settings") {
+        await loadNotifyConfig({signal:controller.signal});
+      }
+    } catch {
+      message = "刷新失败，请重试";
+    } finally {
+      finish(run, message);
+    }
+  }
+
+  function canPull() {
+    return currentPage && !menu.open && !batchResultOpen && window.scrollY <= 0;
+  }
+
+  document.addEventListener("touchstart", event => {
+    if (event.touches.length !== 1) {
+      cancelGesture();
+      return;
+    }
+    if (activeRefresh || !canPull() || event.target.closest(
+      "#acctList, .scroll, pre.log, input, select, textarea, button, a, summary, [contenteditable]"
+    )) return;
+    const touch = event.touches[0];
+    ptr.style.setProperty("--ptr-anchor", $("appTitle").parentElement.getBoundingClientRect().bottom + "px");
+    gesture = {x:touch.clientX, y:touch.clientY, distance:0, claimed:false};
+  }, {passive:true});
+
+  document.addEventListener("touchmove", event => {
+    if (!gesture) return;
+    if (event.touches.length !== 1 || !canPull() || !event.cancelable) {
+      cancelGesture();
+      return;
+    }
+    const touch = event.touches[0];
+    const dx = Math.abs(touch.clientX - gesture.x);
+    const dy = touch.clientY - gesture.y;
+    if (!gesture.claimed) {
+      if (Math.max(dx, Math.abs(dy)) < 8) return;
+      if (dy <= dx) {
+        cancelGesture();
+        return;
+      }
+      gesture.claimed = true;
+    }
+    event.preventDefault();
+    gesture.distance = Math.max(0, Math.min(dy * .5, threshold + 24));
+    const distance = gesture.distance;
+    draw(distance, distance >= threshold ? "ready" : distance > 0 ? "pulling" : "");
+  }, {passive:false});
+
+  document.addEventListener("touchend", () => {
+    if (!gesture) return;
+    const ready = gesture.distance >= threshold && canPull();
+    gesture = null;
+    if (ready) void refreshTab();
+    else draw(0);
+  }, {passive:true});
+  document.addEventListener("touchcancel", cancelGesture, {passive:true});
+
+  return {cancel, cancelGesture};
+})();
+
+const subscriptionView = (() => {
+  // 缓存展开状态和日志快照，轮询时保留阅读位置。
+  const EXPANDED = new Set();
+  let CARDS = Object.create(null);
+  let LAST_LAYOUT = "";  // 账号分组结构签名，变化时才重建骨架
+
+  function toggle(key) {
+    if (EXPANDED.has(key)) EXPANDED.delete(key); else EXPANDED.add(key);
+    const c = CARDS[key];
+    if (!c) return;
+    const open = EXPANDED.has(key);
+    c.body.style.display = open ? "" : "none";
+    if (c.caret) c.caret.textContent = open ? "▲ 收起" : "▼ 展开";
+    if (open) {
+      // 展开时定位到最新一条
+      c.log.scrollTop = c.log.scrollHeight;
+      c.follow = true;
+    }
+  }
+
+  function buildLayout(grouped) {
+    // 本页与"当前登录账号"完全无关：
+    //   * 不把当前账号排到最前（那会让切换账号时列表跳动、看起来像关联了）
+    //   * 不打「当前登录」标签
+    // 账号分组顺序固定为名称升序，任何账号切换都不会改变本页的排列。
+    const accts = Object.keys(grouped).sort((a, b) => a.localeCompare(b, "zh"));
+    const host = $("groups");
+    const previousCards = CARDS;
+    const logPositions = new Map();
+    for (const [key, card] of Object.entries(previousCards)) {
+      if (EXPANDED.has(key)) logPositions.set(key, card.log.scrollTop);
+    }
+    host.innerHTML = "";
+    CARDS = Object.create(null);
+    if (!accts.length) {
+      host.innerHTML = '<div class="empty">还没有自动报名订阅。<br>回到 <a href="./" data-page="events">赛事列表</a> 点「订阅」即可。</div>';
+      return;
+    }
+    for (const acc of accts) {
+      const sec = document.createElement("div");
+      sec.className = "acct-group";
+      const h2 = document.createElement("h2");
+      h2.dataset.accountId = acc;
+      h2.innerHTML = `<span>${esc((grouped[acc][0] || {}).account || ("UID " + acc))}</span><span class="pill" data-role="count"></span>`;
+      const cards = document.createElement("div");
+      cards.className = "cards";
+      sec.appendChild(h2); sec.appendChild(cards);
+      host.appendChild(sec);
+
+      const count = h2.querySelector('[data-role="count"]');
+      for (const x of grouped[acc]) {
+        const existing = previousCards[x.key];
+        if (existing) {
+          existing.count = count;
+          cards.appendChild(existing.root);
+          CARDS[x.key] = existing;
+          continue;
+        }
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `
+          <div class="head" data-role="head">
+            <div class="title">
+              <span data-role="name"></span>
+              <span data-role="status" class="tag"></span>
+              <span class="caret" data-role="caret"></span>
+            </div>
+            <div class="muted" data-role="meta"></div>
+            <div class="latest" data-role="latest"></div>
+          </div>
+          <div class="body" data-role="body">
+            <div class="muted" data-role="detail"></div>
+            <pre class="log" data-role="log"></pre>
+            <div class="row" style="margin-top:6px">
+              <button class="small act" data-role="unsub">取消订阅</button>
+            </div>
+          </div>`;
+        cards.appendChild(card);
+
+        const q = (r) => card.querySelector(`[data-role="${r}"]`);
+        const c = {
+          root: card, head: q("head"), name: q("name"), status: q("status"),
+          caret: q("caret"), meta: q("meta"), latest: q("latest"),
+          detail: q("detail"), body: q("body"), log: q("log"),
+          unsubBtn: q("unsub"),          // 取消订阅按钮：操作时就地反馈用
+          lines: [], follow: true, count,
+        };
+        // 自检：任何必需的子节点缺失都直接暴露出来，而不是抛在设置属性处
+        const missing = Object.entries(c).filter(([k, v]) => v == null && k !== "count")
+                             .map(([k]) => k);
+        if (missing.length) {
+          console.error("卡片缺少子节点", x.key, missing);
+          throw new Error("卡片缺少子节点: " + missing.join(","));
+        }
+        c.head.onclick = () => toggle(x.key);
+        c.unsubBtn.onclick = (e) => { e.stopPropagation(); return unsub(x.key); };
+        // 滚动时判断用户是否停在底部：在底部则继续跟随，否则保持原位
+        c.log.onscroll = () => {
+          c.follow = (c.log.scrollHeight - c.log.scrollTop - c.log.clientHeight) < 24;
+        };
+        CARDS[x.key] = c;
+      }
+    }
+    // 重新挂载节点后恢复位置，再由 updateLog 处理可能发生的轮转。
+    for (const [key, scrollTop] of logPositions) {
+      const card = CARDS[key];
+      if (card) card.log.scrollTop = card.follow ? card.log.scrollHeight : scrollTop;
+    }
+  }
+
+  function updateLog(c, lines) {
+    const previous = c.lines;
+    // 查找旧快照末尾与新快照开头重叠的记录，保留它们对应的节点。
+    const firstKept = previous.findIndex((_, start) =>
+      previous.length - start <= lines.length &&
+      previous.slice(start).every((line, index) => line === lines[index]));
+    const removed = firstKept < 0 ? previous.length : firstKept;
+    const kept = previous.length - removed;
+    if (!removed && kept === lines.length) return;
+
+    let scrollTop = c.log.scrollTop;
+    if (removed) {
+      const anchor = c.log.children[removed];
+      // 按被移除记录的实际高度补偿，包含窄屏上的折行。
+      scrollTop = anchor
+        ? Math.max(0, scrollTop - (anchor.offsetTop - c.log.children[0].offsetTop))
+        : 0;
+      for (let i = 0; i < removed; i++) c.log.removeChild(c.log.children[0]);
+    }
+    for (const line of lines.slice(kept)) {
+      const row = document.createElement("span");
+      row.textContent = line;
+      c.log.appendChild(row);
+    }
+    c.lines = lines;
+    c.log.scrollTop = c.follow ? c.log.scrollHeight : scrollTop;
+  }
+
+  function updateCards(grouped) {
+    for (const acc of Object.keys(grouped)) {
+      for (const x of grouped[acc]) {
+        const c = CARDS[x.key];
+        if (!c) continue;
+        updateUnsubscribeButton(x.key);
+        c.name.textContent = x.name || x.tournament_id;
+        c.status.textContent = x.status || "?";
+        c.status.className = "tag g-" + groupOf(x.status);
+        c.caret.textContent = EXPANDED.has(x.key) ? "▲ 收起" : "▼ 展开";
+        c.meta.textContent =
+          `id=${x.tournament_id} · ${x.player_num ?? "-"}/${x.max ?? "-"} · ${x.window || ""} · ` +
+          (x.completed ? "✅ 已完成" : (x.running ? `守护中 · 已尝试 ${x.attempts} 次` : "未运行"));
+        c.detail.textContent = `uid=${x.uid ?? "-"} · 账号 ${acc}` +
+          (x.orphan ? " · ⚠ 该账号已被删除，订阅无法运行" : "");
+        if (c.count) c.count.textContent = grouped[acc].length + " 条";
+
+        // 卡片头部只显示最新一条日志
+        const lines = x.logs || [];
+        c.latest.textContent = lines.length ? ("最新 " + lines[lines.length - 1]) : "（暂无日志）";
+
+        c.body.style.display = EXPANDED.has(x.key) ? "" : "none";
+        updateLog(c, lines);
+      }
+    }
+    $("groups").querySelectorAll(".acct-group").forEach(sec => {
+      if (!sec.querySelector(".card")) sec.style.display = "none";
+    });
+  }
+
+  let latestSuccessfulState;
+  let stateError = "";
+  function update(state) {
+    if (state.ok) latestSuccessfulState = state;
+    stateError = state.ok ? "" : (state.error || "订阅资料暂不可用");
+    if (!$("subsPage").hidden) render();
+  }
+
+  function removeSubscription(accountId, key) {
+    const previous = latestSuccessfulState?.subs_grouped;
+    const rows = previous?.[accountId];
+    if (!rows?.some(row => row.key === key)) return;
+
+    const grouped = {...previous};
+    const remaining = rows.filter(row => row.key !== key);
+    if (remaining.length) grouped[accountId] = remaining;
+    else delete grouped[accountId];
+    latestSuccessfulState = {...latestSuccessfulState, subs_grouped: grouped,
+      sub_count: Object.values(grouped).flat().length};
+    if (!$("subsPage").hidden) render();
+  }
+
+  function render() {
+    const s = latestSuccessfulState;
+    if (!s) {
+      if (stateError) $("summary").textContent = stateError;
+      return;
+    }
+    const grouped = s.subs_grouped || {};
+    $("summary").textContent = stateError ||
+      `共 ${s.sub_count || 0} 条订阅 · ${Object.keys(grouped).length} 个账号 · ` +
+      `按账号分组，与当前登录账号无关 · 点击卡片展开日志`;
+
+    const sig = Object.keys(grouped).sort().join(";;") + "||" +
+                Object.values(grouped).flat().map(x => x.key).sort().join(",");
+    if (sig !== LAST_LAYOUT) {          // 只有"组成变了"才重建骨架
+      buildLayout(grouped);
+      LAST_LAYOUT = sig;
+    }
+    $("groups").querySelectorAll(".acct-group h2").forEach(heading => {
+      const id = heading.dataset.accountId;
+      heading.firstElementChild.textContent = grouped[id][0]?.account || ("UID " + id);
+    });
+    updateCards(grouped);
+  }
+
+  let MSG_TIMER = null;
+  function setMsg(text, kind) {
+    const el = $("subsStatus");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "banner " + (kind === "err" ? "err" : kind === "ok" ? "ok" : "");
+    el.style.display = "block";
+    if (MSG_TIMER) clearTimeout(MSG_TIMER);
+    MSG_TIMER = setTimeout(() => { el.style.display = "none"; }, 9000);
+  }
+
+  function updateUnsubscribeButton(key) {
+    const button = CARDS[key]?.unsubBtn;
+    if (!button) return;
+    const busy = SUBSCRIPTION_BUSY.has(key);
+    button.disabled = busy;
+    button.textContent = busy ? "处理中…" : "取消订阅";
+  }
+
+  async function unsub(key) {
+    const separator = key.indexOf("|");
+    const acc = key.slice(0, separator), tid = key.slice(separator + 1);
+    const accountEpoch = acc === ACCOUNT_ID ? ACCOUNT_EPOCH : null;
+    if (SUBSCRIPTION_BUSY.has(key) ||
+        !latestSuccessfulState?.subs_grouped?.[acc]?.some(row => row.key === key)) return;
+    if (!confirm(`取消订阅？\n\n账号：${acc}\n赛事 id：${tid}\n\n` +
+                 `确认后该账号不再自动报名这场赛事（已产生的报名不受影响）。`)) return;
+    if (!setSubscriptionBusy(acc, tid, true)) return;
+    let r;
+    try {
+      r = await requestJson("/api/unsubscribe", { method:"POST",
+        body: JSON.stringify({ account_id: acc, tournament_id: tid }) }).catch(netErr);
+      if (r.ok) removeConfirmedSubscription(acc, tid);
+    } finally { setSubscriptionBusy(acc, tid, false); }
+    if (!r.ok) {
+      setMsg("取消订阅失败：" + (r.error || "未知原因"), "err");
+      return;
+    }
+    if (acc === ACCOUNT_ID && accountEpoch === ACCOUNT_EPOCH) {
+      confirmUnsubscription(tid);
+      renderSections();
+    }
+    setMsg("已取消订阅（" + acc + "）", "ok");
+    await refresh();
+    renderSections();
+  }
+
+  $("btnExpandAll").onclick = () => {
+    const keys = Object.keys(CARDS);
+    const anyClosed = keys.some(k => !EXPANDED.has(k));
+    keys.forEach(k => { anyClosed ? EXPANDED.add(k) : EXPANDED.delete(k); });
+    for (const k of keys) {
+      const c = CARDS[k];
+      const open = EXPANDED.has(k);
+      c.body.style.display = open ? "" : "none";
+      c.caret.textContent = open ? "▲ 收起" : "▼ 展开";
+      if (open) { c.log.scrollTop = c.log.scrollHeight; c.follow = true; }
+    }
+  };
+  return {update, render, updateUnsubscribeButton, removeSubscription};
+})();
+
+const panels = {events: $("eventsPage"), subs: $("subsPage"), settings: $("settingsPage")};
+const scrollPositions = {events: 0, subs: 0, settings: 0};
+let pendingEventsScroll = null;
+
+function discardMovedEventsScroll() {
+  if (currentPage === "events" && pendingEventsScroll &&
+      window.scrollY !== pendingEventsScroll.observed) {
+    pendingEventsScroll = null;
+  }
+}
+const menu = $("pageMenu");
+function configureProjectLink() {
+  const link = $("projectGithub");
+  const configured = document.querySelector?.('meta[name="sve-repository"]')?.content || "";
+  link.hidden = true;
+  link.removeAttribute("href");
+  // A plain repository URL only: never embed credentials, queries or tokens.
+  if (!/^https:\/\/github\.com\/[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(configured)) return;
+  link.href = configured;
+  link.hidden = false;
+}
+configureProjectLink();
+const menuToggle = $("navToggle");
+const backToTop = $("backToTop");
+const modalMenu = typeof menu.showModal === "function" && typeof menu.close === "function";
+if (!modalMenu) {
+  menu.classList.add("inline-nav");
+  menuToggle.hidden = true;
+}
+const pageLinks = menu.querySelectorAll("a[data-page]");
+let currentPage;
+let pageVisit = 0;
+
+function pageFromUrl() {
+  if (location.pathname === APP_ROOT + "settings") return "settings";
+  return location.pathname === APP_ROOT + "subs" ? "subs" : "events";
+}
+
+function updateBackToTop() {
+  const atTop = window.scrollY <= 0;
+  if (atTop && document.activeElement === backToTop) $("appTitle").focus({preventScroll:true});
+  backToTop.hidden = atTop || (modalMenu && menu.open) || batchResultOpen;
+}
+
+backToTop.onclick = () => {
+  // A manual return to the top supersedes a position saved before a failed query.
+  if (currentPage === "events") pendingEventsScroll = null;
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.scrollTo({top:0, behavior:reduceMotion ? "auto" : "smooth"});
+  updateBackToTop();
+};
+
+function showLocation() {
+  if (batchResultOpen && history.state?.batchResult !== batchDialogOrigin.historyKey) dismissBatchResult();
+  const page = pageFromUrl();
+  if (modalMenu) {
+    const menuOpen = history.state?.pageMenu === true;
+    if (menuOpen && !menu.open) {
+      pullRefresh.cancelGesture();
+      menu.showModal();
+    }
+    if (!menuOpen && menu.open) menu.close();
+    menuToggle.setAttribute("aria-expanded", String(menuOpen));
+  }
+
+  if (page === currentPage) {
+    updateBackToTop();
+    updateBatchButton();
+    return;
+  }
+  discardMovedEventsScroll();
+  if (currentPage) {
+    const pendingScroll = currentPage === "events" ? pendingEventsScroll?.offset : null;
+    scrollPositions[currentPage] = pendingScroll ?? Math.max(0, window.scrollY);
+  }
+  if (currentPage === "settings") resetSettingsInputs();
+  currentPage = page;
+  const visit = ++pageVisit;
+  pullRefresh.cancel();
+  for (const [name, panel] of Object.entries(panels)) panel.hidden = name !== page;
+  for (const link of pageLinks) {
+    if (link.dataset.page === page) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  if (page === "subs") subscriptionView.render();
+  else if (page === "events") renderAccountList();
+  window.scrollTo(0, scrollPositions[page]);
+  updateBackToTop();
+  if (page === "events" && pendingEventsScroll) pendingEventsScroll.observed = window.scrollY;
+
+  if (page === "events") {
+    requiredEventStateSequence = REFRESH_SEQUENCE + 1;
+    beginTournamentValidation();
+    refresh().then(() => {
+      if (visit === pageVisit) return queryEvents();
+    });
+  } else {
+    updateBatchButton();
+    refresh();
+    if (page === "settings") {
+      resetSettingsInputs();
+      $("settingsConnectionStatus").textContent = "正在读取最新设置状态…";
+      $("settingsConnectionStatus").style.display = "block";
+      $("remoteBox").textContent = "正在读取执行位置…";
+      $("notifyBox").textContent = "正在读取通知设置…";
+      loadNotifyConfig();
+    }
+  }
+}
+
+// The drawer and batch results use history so browser and WebView Back dismiss them.
+history.scrollRestoration = "manual";
+window.addEventListener("popstate", showLocation);
+window.addEventListener("scroll", () => {
+  discardMovedEventsScroll();
+  if (window.scrollY > 0) pullRefresh.cancelGesture();
+  updateBackToTop();
+}, {passive: true});
+if (modalMenu) {
+  menuToggle.onclick = () => {
+    history.pushState({pageMenu:true}, "", location.href);
+    showLocation();
+  };
+  menu.addEventListener("cancel", event => {
+    event.preventDefault();
+    history.back();
+  });
+  menu.addEventListener("click", event => {
+    if (event.target === menu) history.back();
+  });
+}
+document.addEventListener("click", event => {
+  const link = event.target.closest("a[data-page]");
+  if (!link || event.defaultPrevented || event.button !== 0 ||
+      event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  const menuOpen = modalMenu && menu.open;
+  if (link.dataset.page === currentPage) {
+    if (menuOpen) history.back();
+    return;
+  }
+  if (menuOpen) history.replaceState(null, "", link.href);
+  else history.pushState(null, "", link.href);
+  showLocation();
+});
+
+window.addEventListener("online", async () => {
+  const visit = pageVisit;
+  await refresh();
+  if (visit === pageVisit && currentPage === "events" && (!AREAS.length || tournamentsUnverified)) {
+    await queryEvents();
+  }
+  if (visit === pageVisit && currentPage === "settings") await loadNotifyConfig();
+});
+window.addEventListener("pageshow", event => {
+  if (event.persisted && pageFromUrl() === "settings") {
+    resetSettingsInputs();
+    refresh();
+    loadNotifyConfig();
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pullRefresh.cancelGesture();
+  else {
+    refresh();
+    if (currentPage === "settings") loadNotifyConfig();
+  }
+});
+setInterval(refresh, 2000);
+function updateClock() { $("clock").textContent = new Date().toLocaleTimeString(); }
+setInterval(updateClock, 1000);
+updateClock();
+showLocation();
+</script>
+<script>
+// 注册 Service Worker —— **仅在安全上下文下**（https 或 localhost）。
+// 用 http://<局域网IP>:8801 打开时 navigator.serviceWorker 可能不存在，
+// 或 register() 会失败；这里静默跳过，不往控制台抛无意义的错误。
+(function () {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(function (e) {
+      console.warn('[PWA] Service Worker 注册失败（不影响正常使用）：', e);
+    });
+  });
+})();
+</script>
+</body>
+</html>

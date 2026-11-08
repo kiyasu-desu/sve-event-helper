@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标用矢量绘制：仓库里不引入二进制图片，且任意分辨率都清晰。
+     图形取「SVE」+ 强调色横条，与 Web 界面顶部观感一致。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 底部强调色横条 -->
+    <path
+        android:fillColor="#3b82f6"
+        android:pathData="M30,74 h48 v6 h-48 z" />
+
+    <!-- 简化的 S 形：两段弧线 -->
+    <path
+        android:strokeColor="#e5e7eb"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M68,38 a14,10 0 0 0 -28,0 a14,10 0 0 0 28,0" />
+
+    <!-- V 形 -->
+    <path
+        android:strokeColor="#e5e7eb"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000"
+        android:pathData="M36,54 L50,68 L64,54" />
+</vector>

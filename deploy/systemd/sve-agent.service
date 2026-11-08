@@ -1,0 +1,40 @@
+[Unit]
+Description=SVE 自动报名代理（账号/订阅/调度/自动报名/通知）
+Documentation=file://__APP_DIR__/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SVE_USER__
+Group=__SVE_USER__
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/sve/secrets.env
+UMask=0077
+StateDirectory=sve
+StateDirectoryMode=0700
+# 报名时段按北京时间判断，不依赖宿主机时区（云镜像默认常是 UTC）
+Environment=TZ=Asia/Shanghai
+# 只监听 127.0.0.1；本机客户端通过 ssh -L 隧道访问，不开放任何公网端口
+Environment=SVE_CLIENT_PORT=8901
+
+ExecStart=__APP_DIR__/.venv/bin/python -B -u app/client/server.py
+
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# StateDirectory 在沙箱建立前创建受保护的运行目录。
+ReadWritePaths=/var/lib/sve
+
+[Install]
+WantedBy=multi-user.target

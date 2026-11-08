@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SVE 赛事助手</string>
+    <string name="login_title">新增账号</string>
+    <string name="add_account">新增账号</string>
+    <string name="login_hint">请在下方页面完成登录（支持手机号验证码 / 密码，取决于页面提供的方式）。\n登录成功后会自动读取会话并保存到服务器。</string>
+    <string name="login_waiting">等待登录完成…</string>
+    <string name="login_exchanging">正在换取会话…</string>
+    <string name="login_ok">登录成功：%1$s</string>
+    <string name="login_failed">登录失败：%1$s</string>
+    <string name="back">返回</string>
+    <string name="login_confirming">已检测到新的登录凭据，正在确认…（若页面还有验证码/滑块，请先完成）</string>
+    <string name="login_waiting_new">请在下方页面完成登录（检测到的是上次遗留的旧会话，不会使用）</string>
+</resources>

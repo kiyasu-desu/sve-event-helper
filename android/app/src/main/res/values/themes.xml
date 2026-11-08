@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 与 Web 界面同色系（深色底 #0f1116 / 强调蓝），减少原生与网页之间的割裂感 -->
+    <style name="Theme.SveMonitor" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">#3b82f6</item>
+        <item name="android:windowBackground">#0f1116</item>
+        <item name="android:statusBarColor">#0f1116</item>
+        <item name="android:navigationBarColor">#0f1116</item>
+    </style>
+</resources>

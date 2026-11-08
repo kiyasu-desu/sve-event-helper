@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>SVE 登录验证原型</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #12141a; color: #d8dae0;
+               font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+  #bar { height: 34px; display: flex; align-items: center; gap: 12px;
+         padding: 0 12px; background: #1b1e26; border-bottom: 1px solid #2b3040;
+         font-size: 12px; }
+  #bar b { color: #7fd1a0; font-weight: 600; }
+  #status { flex: 1; }
+  #frame { width: 100%; height: calc(100% - 35px); border: 0; background: #fff; }
+  .pill { padding: 2px 8px; border-radius: 9px; background: #2b3040; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span class="pill">SVE 登录验证原型</span>
+    <span id="status">等待登录页加载…</span>
+    <span class="pill">回调 <code>/login_callback</code></span>
+  </div>
+  <iframe id="frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+  <script>
+    // 登录页由宿主通过 /__login_url 提供：宿主负责构造回调契约 URL。
+    fetch('/__login_url').then(function (r) { return r.text(); }).then(function (u) {
+      document.getElementById('frame').src = u;
+      document.getElementById('status').textContent = '登录页已加载，请完成登录…';
+    });
+    // 轮询宿主状态，拿到 sessionid 后提示
+    setInterval(function () {
+      fetch('/__status').then(function (r) { return r.json(); }).then(function (s) {
+        if (s.sessionid) {
+          document.getElementById('status').innerHTML =
+            '<b>已拿到 sessionid</b> — ' + s.sessionid.slice(0, 16) + '…（窗口即将关闭）';
+        } else if (s.hits) {
+          document.getElementById('status').textContent = '收到回调 ' + s.hits + ' 次，解析中…';
+        }
+      }).catch(function () {});
+    }, 1000);
+  </script>
+</body>
+</html>

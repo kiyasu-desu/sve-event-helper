@@ -1,0 +1,41 @@
+# ===================================================================
+#  Android 工程的忽略规则
+#
+#  原则：**源码与构建脚本进仓库，产物与机器相关文件不进**。
+#  尤其是 APK —— 它是可执行产物，且一旦含签名信息就不该外传。
+# ===================================================================
+
+# 构建产物
+build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+output.json
+
+# Gradle
+.gradle/
+gradle-app.setting
+.gradletasknamecache
+
+# 机器相关（含本机 SDK 路径，绝不能提交）
+local.properties
+private.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 签名材料 —— 万一将来做正式签名，密钥库绝不能进仓库
+*.jks
+*.keystore
+keystore.properties
+
+# 构建日志（不该入库）
+*.log
+*.log.err
+build-out*
