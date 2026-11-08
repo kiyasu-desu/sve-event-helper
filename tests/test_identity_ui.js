@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 function harness(pathname='/') {
+  const html = fs.readFileSync('app/client/ui/index.html','utf8');
+  const repository = html.match(/<meta name="sve-repository" content="([^"]+)">/);
   const elements = new Map();
   const events = {};
   function element() {
@@ -25,6 +27,7 @@ function harness(pathname='/') {
     confirm(){return true;},alert(){},navigator:{},addEventListener(){},location:{pathname},history:{},
     window:{scrollY:0,scrollTo(){},addEventListener(name,fn){events[name]=fn;},location:{},innerHeight:800},
     document:{body:{style:{},children:[]},createTextNode:text=>text,getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id);},
+      querySelector(selector){return selector==='meta[name="sve-repository"]' && repository ? {content:repository[1]} : null;},
       querySelectorAll(){return [];},addEventListener(name,fn){events[name]=fn;},createElement:element},
     fetch(){throw new Error('fetch must be stubbed');}});
   const historyEntries=[null];
@@ -42,7 +45,7 @@ function harness(pathname='/') {
       events.popstate();
     }
   });
-  let source = fs.readFileSync('app/client/ui/index.html','utf8').match(/<script\b[^>]*>([\s\S]*?)<\/script>/)[1];
+  let source = html.match(/<script\b[^>]*>([\s\S]*?)<\/script>/)[1];
   source = source.slice(0, source.lastIndexOf('setInterval(refresh'));
   vm.runInContext(source, context);
   return {context,elements,events,run:code=>vm.runInContext(code,context)};
@@ -995,6 +998,44 @@ test('the account header changes ID immediately on selection and clears an inval
   assert.equal(h.elements.get('activeNickname').textContent,'未登录');
   assert.equal(h.elements.get('activeUid').textContent,'');
   assert.equal(h.elements.get('activeUid').hidden,true);
+});
+
+test('all app pages initialize the GitHub entry from the shipped M21 metadata',()=>{
+  const expected='https://github.com/kiyasu-desu/sve-event-helper';
+  const html=fs.readFileSync('app/client/ui/index.html','utf8');
+  assert.match(html,/私有仓库需 GitHub 登录及访问权限/);
+  assert.match(html,/<a id="projectGithub" target="_self" rel="noreferrer"/);
+  for(const route of ['/','/subs','/settings','/test-mount/settings']) {
+    const h=harness(route),link=h.elements.get('projectGithub');
+    assert.equal(link.href,expected);
+    assert.equal(link.hidden,false);
+    assert.equal(new URL(link.href).search,'');
+    assert.equal(new URL(link.href).hash,'');
+  }
+});
+
+test('M21 PWA activation retires the old shell and online navigation caches the shipped link',async()=>{
+  const handlers={},deleted=[],stored=[];
+  const html=fs.readFileSync('app/client/ui/index.html','utf8');
+  const fresh={body:html,clone(){return this;}};
+  const c=vm.createContext({URL,
+    self:{location:{origin:'https://sve.example.com'},registration:{scope:'https://sve.example.com/'},
+      addEventListener(name,fn){handlers[name]=fn;},clients:{async claim(){}}},
+    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell'];},
+      async delete(key){deleted.push(key);},async open(key){return {async put(req,response){stored.push({key,response});}};},
+      async match(){throw Error('online navigation must use the fresh page');}},
+    fetch:async()=>fresh});
+  vm.runInContext(fs.readFileSync('app/client/ui/sw.js','utf8'),c);
+  let pending;
+  handlers.activate({waitUntil(value){pending=value;}});
+  await pending;
+  assert.deepEqual(deleted,['sve-v25-new-repository-shell']);
+  handlers.fetch({request:{method:'GET',mode:'navigate',url:'https://sve.example.com/settings'},
+    respondWith(value){pending=value;}});
+  assert.equal((await pending).body,html);
+  assert.equal(stored.length,1);
+  assert.equal(stored[0].key,'sve-v26-m21-repository-link-shell');
+  assert.match(stored[0].response.body,/<meta name="sve-repository" content="https:\/\/github.com\/kiyasu-desu\/sve-event-helper">/);
 });
 
 test('the GitHub entry uses plain repository metadata and rejects non-repository URLs',()=>{
