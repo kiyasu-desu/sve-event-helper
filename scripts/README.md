@@ -19,40 +19,15 @@
 
 当前回归使用 `tests/test_m00_data_protection.py`（同时覆盖 M00/M01）与 `tests/test_identity_ui.js`。历史自检的真实导入、`--help`、通知探测可能有副作用，需先审阅并隔离路径，不能将其视为生产只读检查。
 
-## poller/ —— 旧轮询器（大部分已退役）与少量共享模块
+## runtime/ 与现役共享模块
 
-> **当前架构不是这个目录。** 现在是「本机客户端（`app/client/`，Web 界面）+
-> 服务器代理（`sve-agent`）+ 订阅体系」，见仓库根 `README.md`。
-> 盯哪场赛事由界面里的**订阅**决定，不再由轮询器的配置指定。
->
-> 本目录里只有两个文件仍在运行链路中：**`notify.py`**（代理发通知时导入）
-> 与 **`watchdog.py`**（`sve-watchdog.timer` 调用）。其余属于单账号单赛事的
-> 旧方案，已退役但保留，供对照与复用。
+- `runtime/watchdog.py --once`：代理进度看护，直接读取 RuntimePaths 与通知配置。
+- `app/client/core/notification_sender.py`：代理、看护、显式部署通知诊断共用的通知发送器。
+- `poller/watchdog.py --once --agent`：既有 unit 临时兼容转发，与新入口共用状态、写锁和日志。
+- `poller/notify.py`：临时导入别名，模块对象与现役发送器一致。
+- `probe/signer.py`：开发签名工具，不进入生产包；旧 signer 路径仅为开发导入别名。
 
-| 文件 | 状态 | 说明 |
-|---|---|---|
-| `notify.py` | **核心（仍在用）** | 双通道通知（PushPlus + 邮件）。**服务器代理会导入它**，改动需谨慎 |
-| `watchdog.py` | **核心（仍在用）** | 看护的 Python 版，由 `sve-watchdog.timer` 调用（`--agent` 模式检查代理） |
-| `signer.py` | 工具（仍被调用） | 签名算法。**代理走的是 `app/client/core/sveapi.py`**；此文件供 `session_manager.py` 与 `probe/` 使用 |
-| `poll.py` | 已退役 | 常驻轮询器（单赛事单账号）。原为"核心"，大奖赛纳入订阅体系后不再运行 |
-| `autosignup.py` | 已退役 | 自动报名的保护链（白名单、赛事名校验、自旋刷新、两段复核）。**其设计已被代理的调度器吸收** |
-| `session_manager.py` | 已退役 | 会话校验与自动恢复（读 APP 的 AsyncStorage / Frida） |
-| `action.py` | 已退役 | 手动报名/取消/查状态（`--status` / `--signup` / `--cancel`） |
-| `watchdog.ps1` | 已退役 | 看护的 PowerShell 版（已被 `watchdog.py` 取代） |
-| `watchdog_ctl.ps1` | 已退役 | 看护的启停（Windows 侧） |
-| `test_window.ps1` | 工具 | 报名时段判定的回归测试（13 个边界用例，含跨零点） |
-
-### 轮询器的单实例锁（仅对已退役的 poll.py）
-
-`poll.py` 常驻模式会写 `capture/poller.pid`；已有存活实例时**拒绝启动**（exit 4）。
-`--once` 不加锁（一次性排查允许并发）。需要强制再起一个用 `--force`。
-
-> 为什么加这个：以前靠"命令行里是否含 `poll.py`"来判断实例数，
-> 结果把启动器包装进程当成第二个实例，还误杀了真正在跑的守护进程。
-> 让程序自己声明"我在跑"远比外部猜测可靠。
-
-> ⚠️ **唯一执行点**：`sve-agent` 与 `sve-poller` 同一时间只能有一个在跑，
-> 否则会对同一场赛事重复提交。`deploy/verify.sh` 有专门一节断言这一点。
+旧 poll/action/autosignup/session_manager 和 probe_action 无条件拒绝导入和启动，包括 help、单次与直连调用；旧 PowerShell 控制器同样退出。旧实现通过 Git 历史追溯。新包不包含旧执行实现、签名工具或 poller unit。兼容入口在所有私人 unit/工具迁移并验证后移除。见 [M20](../deploy/M20-retire-legacy-poller.md)。
 
 ---
 
@@ -85,11 +60,11 @@
 |---|---|
 | `list_sign.py` | **穷举反推 list 接口的签名内容**（11 种候选，唯一命中） |
 | `verify_sign.py` / `bruteforce_sign.py` | 签名算法的早期验证 |
-| `probe_api.py` / `probe_action.py` | 接口探测 |
-| `test_autosignup_spin.py` | 自旋刷新逻辑的单元测试（4 场景，不触网） |
-| `test_autosignup_confirm.py` | 两次复核流程的单元测试（6 场景，不触网） |
+| `probe_api.py` | 只读开发接口探测 |
+| `test_autosignup_spin.py` | 转发现役调度器回归 |
+| `test_autosignup_confirm.py` | 转发现役调度器回归 |
 
-后两个是**有回归价值的测试**，改动 `autosignup.py` 后应重跑。
+窗口、复核与状态变化场景维护在 `tests/test_m20_retirement.py`；去重回归维护在 `tests/test_m06_watchdog.py`。
 
 ---
 
@@ -167,12 +142,12 @@ Python 侧没有这个问题，统一无 BOM 即可（在源文件里声明 `enc
 ### 4. 判断进程存活请用 pid 文件，不要匹配命令行
 
 命令行匹配会把"你自己那条含关键字的诊断命令"和"启动器包装进程"一起匹配进来，
-已经因此误判过两次。参考 `watchdog_ctl.ps1` 与 `poll.py` 的锁实现。
+已经因此误判过两次。现役看护使用 WriterLock，代理使用进度协议检查真实线程。
 
 ### 5. 后台进程不要用后台作业(background job)启动
 
 作业被取消或会话清理时会把子进程一起杀掉（表现为"以为在看护、其实早死了"）。
-用 `Start-Process` 独立启动 + pid 文件（见 `watchdog_ctl.ps1`）。
+生产看护由 systemd timer 托管，Windows 不承担常驻看护。
 
 ### 6. 改完脚本请跑自检
 
@@ -184,14 +159,4 @@ python scripts\recon\check_ps1.py                    # 只查 PowerShell
 
 ### 7. 测试必须把日志指到独立文件
 
-`autosignup.py` 的日志目标 `LOGFILE` 是**可运行时替换**的。任何单元测试都要改它：
-
-```python
-A.LOGFILE = os.path.join(PROJECT_ROOT, "vendor", "tmp", "test_poll.log")
-```
-
-否则测试输出会混进 `capture/poll.log`，看起来就像**生产环境发生了自动报名**——
-曾经因为这件事误判过一次（日志里出现 `静默等待 0 秒`、`模拟抖动` 等测试特征）。
-
-同理，`check_scripts.py` 的"真实导入"步骤会跳过 `test_*.py`：
-测试模块的执行方式是**显式运行它们自己**，而不是被别人导入。
+调度器使用模拟客户端与回调；看护、部署回归使用 TemporaryDirectory 和通知替身。测试前设置隔离的 SVE_DATA_DIR/SVE_SETTINGS_FILE，禁止把日志、状态或备份写入生产目录。真实导入检查跳过旧 poller 目录和测试模块，旧测试命令只转发到现役回归。

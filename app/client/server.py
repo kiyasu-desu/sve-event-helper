@@ -40,12 +40,7 @@ from flask import Flask, jsonify, request, send_from_directory, g, has_request_c
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "core"))
 
-# 仓库根（app/client -> app -> 根）。代理模式要用到 scripts/poller/notify.py，
-# 复用同一份通知实现，避免"两处各写一套、行为漂移"。
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
-POLLER_DIR = os.path.join(REPO_ROOT, "scripts", "poller")
-if os.path.isdir(POLLER_DIR) and POLLER_DIR not in sys.path:
-    sys.path.insert(0, POLLER_DIR)
 
 from sveapi import (Account, SveClient, SveError, classify_status,  # noqa: E402
                     classify_class, CLASS_ORDER, CLASS_LABEL, HIDDEN_BY_DEFAULT,
@@ -754,7 +749,7 @@ def api_notify_test():
                time.strftime("%Y-%m-%d %H:%M:%S")))
     results = []
     try:
-        import notify as _n
+        import notification_sender as _n
         for name, ok, detail in _n.notify_all(ch, title, html):
             results.append({"channel": name if name in NOTIFY_FIELDS else "unknown", "ok": bool(ok),
                             "detail": "发送成功" if ok else "发送失败，请检查通知配置或网络"})
@@ -1191,13 +1186,13 @@ def notify_config_view() -> dict:
 
 
 def send_notify(title: str, html: str) -> None:
-    """发送通知。复用 scripts/poller/notify.py 的实现（PushPlus + 邮件 + 重试）。"""
+    """发送通知。复用 core/notification_sender.py 的实现（PushPlus + 邮件 + 重试）。"""
     ch = notify_channels()
     if not ch:
         log("未找到通知配置（%s），跳过通知" % AGENT_SETTINGS)
         return
     try:
-        import notify as _n
+        import notification_sender as _n
         results = _n.notify_all(ch, title, html)
         for name, ok, detail in results:
             log("通知[%s] %s %s" % (name, "成功" if ok else "失败", detail))

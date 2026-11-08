@@ -399,25 +399,95 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(diagnostics.storage_probe(self.target, external)["ok"])
         self.assertFalse(list(external.rglob(".sve-permission-*")))
 
-    def test_m04_manifest_remains_valid_but_not_a_new_candidate(self):
-        manifest = dict(self.manifest, files=dict(self.manifest["files"]))
-        for name in release.M05_ADDITIONS | release.M06_ADDITIONS:
-            del manifest["files"][name]
-            (self.package / name).unlink()
+    def historical_package(self, names):
+        manifest = dict(self.manifest, files={})
+        for path in self.package.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        for name in names:
+            data = subprocess.check_output(["git", "-C", str(ROOT), "show", "ab5200b:" + name])
+            if name.endswith((".sh", ".service", ".timer")):
+                data = data.replace(b"\r\n", b"\n")
+            self.put(self.package, name, data)
+            manifest["files"][name] = release.digest(data)
         release.write_json(self.package / "release.json", manifest)
+        return manifest
+
+    def test_m04_manifest_remains_valid_but_not_a_new_candidate(self):
+        manifest = self.historical_package(release.LEGACY_FILES)
         self.assertEqual(manifest, release.verify_package(self.package))
         with self.assertRaises(ValueError):
             release.preflight(self.package, self.target)
 
     def test_m05_manifest_remains_verifiable_for_rollback(self):
-        manifest = dict(self.manifest, files=dict(self.manifest["files"]))
-        for name in release.M06_ADDITIONS:
-            del manifest["files"][name]
-            (self.package / name).unlink()
-        release.write_json(self.package / "release.json", manifest)
+        manifest = self.historical_package(release.M05_FILES)
         self.assertEqual(manifest, release.verify_package(self.package))
+
+    def test_m20_retirement_restores_old_manifest_and_preserves_watchdog_state(self):
+        historical = self.historical_package(release.M06_FILES)
+        for name in (*release.M06_FILES, "release.json"):
+            self.put(self.target, name, (self.package / name).read_bytes())
+        self.put(self.data, "watchdog/watchdog-state.json", b'{"synthetic": true}', private=True)
+        self.put(self.target, "scripts/poller/private-tool.py", b'# preserved unknown file')
+        before = self.private_hashes()
+        for path in self.package.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        self.manifest = self.candidate(self.package)
+        with self.assertRaises(OSError):
+            self.switch(fail_after="retired")
+        for name in release.RETIRED_FILES:
+            self.assertFalse((self.target / name).exists())
+        release.rollback(self.target, writers_stopped=True)
+        self.assertEqual(historical, release.verify_package(self.target, installed=True))
+        self.assertEqual(before, self.private_hashes())
+        self.switch()
+        release.rollback(self.target, writers_stopped=True)
+        self.assertEqual(historical, release.verify_package(self.target, installed=True))
+        self.assertEqual(before, self.private_hashes())
+        self.assertTrue((self.target / "scripts/poller/private-tool.py").exists())
+
+    def test_new_package_old_and_new_watchdog_cli_use_same_state_without_legacy_code(self):
+        for name in release.RETIRED_FILES:
+            self.assertFalse((self.package / name).exists())
+        code = """import io,json,os,runpy,socket,sys,urllib.request
+from pathlib import Path
+from unittest.mock import Mock,patch
+root,data=Path(sys.argv[1]),Path(sys.argv[2])
+os.environ['SVE_DATA_DIR']=str(data)
+os.environ['SVE_SETTINGS_FILE']=str(data/'settings.json')
+sys.path.insert(0,str(root/'app/client/core'))
+import notification_sender
+snapshot={'health_version':1,'ok':True,'mode':'executor','process_id':'synthetic-process','tasks':[]}
+opener=Mock()
+def response(*a,**k): return io.BytesIO(json.dumps(snapshot).encode())
+opener.open.side_effect=response
+with patch.object(socket.socket,'connect',side_effect=AssertionError('network')),patch.object(urllib.request,'build_opener',return_value=opener),patch.object(notification_sender,'notify_all',side_effect=AssertionError('notification')):
+ for path,args in [('scripts/poller/watchdog.py',['--once','--agent']),('scripts/runtime/watchdog.py',['--once'])]:
+  sys.argv=[str(root/path),*args]
+  try: runpy.run_path(str(root/path),run_name='__main__')
+  except SystemExit as result: assert result.code==0
+  assert (data/'watchdog/watchdog-state.json').is_file()
+ assert opener.open.call_count==2
+assert not any(name in sys.modules for name in ['poll','autosignup','session_manager'])
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(self.package), str(self.data)],
+                                capture_output=True, timeout=30)
+        self.assertEqual(0, result.returncode, result.stderr.decode(errors="replace"))
+
+    def test_current_installed_verifier_rejects_reintroduced_retired_code(self):
+        self.switch()
+        self.put(self.target, release.RETIRED_FILES[0], b"# synthetic stray legacy code")
         with self.assertRaises(ValueError):
-            release.preflight(self.package, self.target)
+            release.verify_package(self.target, installed=True)
+
+    def test_retired_nonregular_path_refused_before_backup_or_changes(self):
+        (self.target / release.RETIRED_FILES[0]).mkdir(parents=True)
+        before = (self.target / "app/client/server.py").read_bytes()
+        with self.assertRaises(ValueError):
+            self.switch()
+        self.assertEqual(before, (self.target / "app/client/server.py").read_bytes())
+        self.assertFalse((self.target / "deployment-state.json").exists())
 
     def test_manifest_paths_and_schema_cannot_change_contract(self):
         for change in ({"schema_version": 1}, {"compatible_schemas": [1, 2]},

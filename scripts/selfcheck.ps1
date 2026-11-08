@@ -24,12 +24,9 @@ $p = Test-ProjectPaths
 $p | Format-List | Out-String | Write-Host
 
 # 这些是运行监控所必需的
-foreach ($name in 'AdbExe', 'VenvPython', 'ApkPath') {
+foreach ($name in 'VenvPython') {
     if (-not $p.$name) { Write-Host ('MISSING: ' + $name); $fail++ }
 }
-if (-not $p.CaptureDir) { Write-Host 'MISSING: capture 目录'; $fail++ }
-if (-not $p.SessionFile) { Write-Host 'MISSING: session.json（会话凭证，轮询器必需）'; $fail++ }
-if (-not $p.StateFile) { Write-Host 'MISSING: state.json（首次轮询后生成）'; $fail++ }
 if (-not $p.PythonDepsOk) { Write-Host ('MISSING python deps: ' + $p.MissingPython); $fail++ }
 
 # 以下为可选：仅抓包/证书相关用到
@@ -79,46 +76,17 @@ foreach ($f in $reconAssets) {
         Write-Host ('OK      ' + $f.Replace($ProjectRoot + '\', '') + '  (' + $kb + ' KB)')
     } else {
         Write-Host ('MISSING ' + $f)
-        $fail++
     }
 }
 
 # ---------------------------------------------------------------- 运行状态
 Section 'running state'
-# 轮询器用 pid 文件声明自己是唯一实例（capture/poller.pid）。
-# 不要用"命令行里是否含 poll.py"来数实例：那会把启动器包装进程也算进去，
-# 从而误报成两个实例（曾经因此误杀过真正在跑的守护进程）。
-$pollerLock = Join-Path $CaptureDir 'poller.pid'
-if (Test-Path $pollerLock) {
-    $pPid = Get-Content $pollerLock -ErrorAction SilentlyContinue | Select-Object -First 1
-    $pProc = if ($pPid) { Get-Process -Id ([int]$pPid) -ErrorAction SilentlyContinue } else { $null }
-    if ($pProc) {
-        Write-Host ('poller      : running pid=' + $pPid)
-    } else {
-        Write-Host ('poller      : pid file present but pid ' + $pPid + ' is gone')
-        $fail++
-    }
-} else {
-    Write-Host 'poller      : not running (capture/poller.pid absent)'
-}
-
-$wdPidFile = $WatchdogPid
-if (Test-Path $wdPidFile) {
-    $wdPid = Get-Content $wdPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
-    $wd = if ($wdPid) { Get-Process -Id ([int]$wdPid) -ErrorAction SilentlyContinue } else { $null }
-    if ($wd) { Write-Host ('watchdog    : running pid=' + $wdPid) }
-    else { Write-Host 'watchdog    : pid file present but process gone'; $fail++ }
-} else {
-    Write-Host 'watchdog    : not running'
-}
-
-$done = Test-Path $CompletionFile
-Write-Host ('task        : ' + $(if ($done) { 'COMPLETED (capture/completed.json exists)' } else { 'pending' }))
+Write-Host 'Legacy poller retired. Use deploy/verify.sh for agent state and the agent watchdog for scheduler progress.'
 
 # ---------------------------------------------------------------- 设备状态
 Section 'emulator state (read-only)'
 if ($AdbExe) {
-    foreach ($d in @(@{ n = 'sve '; s = $SveSerial; must = $true },
+    foreach ($d in @(@{ n = 'sve '; s = $SveSerial; must = $false },
                      @{ n = 'sve2'; s = $Sve2Serial; must = $false },
                      @{ n = 'pjsk'; s = $PjskSerial; must = $false })) {
         $online = Test-DeviceOnline -Serial $d.s
@@ -140,7 +108,6 @@ if ($AdbExe) {
     }
 } else {
     Write-Host 'adb not found; skipped'
-    $fail++
 }
 
 # ---------------------------------------------------------------- 结果

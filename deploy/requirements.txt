@@ -1,14 +1,12 @@
 # SVE —— Linux 服务器依赖
 #
-# 常驻链路 (poll.py / autosignup.py / notify.py / session_manager.py) 与
+# 现役链路 (server.py / scheduler.py / notification_sender.py / watchdog.py) 与
 # 客户端核心 (app/client/core/sveapi.py, scheduler.py) 用到的
 # 其余模块全是标准库：json/os/re/sqlite3/subprocess/tempfile/smtplib/urllib。
 #
-# 注意：frida 是**可选**的，只在"从模拟器恢复会话"时才需要，且是延迟 import。
-# Linux 服务器上没有 MuMu，不需要装它（装了也没用）。
+# frida 仅供另行安装的抓包开发工具使用，现役服务器不依赖设备或会话恢复。
 requests>=2.31,<3
 
 # 自动报名代理（sve-agent，跑 app/client/server.py）需要 Flask。
-# 只部署纯轮询器（scripts/poller）时用不到，但一起装上更省事，
-# 也方便后续把调度统一到代理里。
+# 通知与看护复用现役运行模块，旧执行实现不进入生产包。
 flask>=3.0,<4

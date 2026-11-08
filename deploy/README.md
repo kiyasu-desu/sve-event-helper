@@ -100,3 +100,7 @@ M01→M02–M04 的数据仍为 schema 2，可保留上线后的新会话、资�
 `install.sh /绝对路径/发布目录` 只接受尚无 server.py 和权威数据的首次安装；已有部署必须走上面的升级路径。首次安装会 apt/pip、建虚拟环境和目录、写新的 unit，但不自动启动服务、不覆盖已有 unit/drop-in、不导入来源包私有配置。先准备受保护签名配置；模板在发布包的 config/settings.example.json。首次安装、代码升级、服务启用和手机生产验收分别执行。
 
 SSH 入口见 [SSH 指南](PWA-SSH-Tunnel.md)，Tailscale 入口见 [Tailscale 指南](PWA-Tailscale.md)，Android 说明见 [Android](Android-App.md)。它们是可选部署形态；生产现有 Cloudflare 入口继续保留。不要运行旧 poll.py --once、自检或安装器来证明安全；旧脚本可能写日志、请求官方或发消息。
+
+## M20 退役升级
+
+新 unit 使用 `scripts/runtime/watchdog.py --once`；旧 `scripts/poller/watchdog.py --once --agent` 保留兼容。发布事务只备份、删除五个固定旧 Python 代码路径，回退恢复其原始字节，运行数据不回退。旧 unit 的禁用/屏蔽、私人 drop-in 核对和维护窗口步骤见 [M20](M20-retire-legacy-poller.md)。只启用同一个看护 timer。

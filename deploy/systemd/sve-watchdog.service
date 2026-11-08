@@ -21,7 +21,7 @@ StateDirectoryMode=0700
 Environment=TZ=Asia/Shanghai
 
 # 只读取 loopback 进度并按持久化状态告警，不启动报名执行器。
-ExecStart=__APP_DIR__/.venv/bin/python -B scripts/poller/watchdog.py --once --agent
+ExecStart=__APP_DIR__/.venv/bin/python -B scripts/runtime/watchdog.py --once
 
 NoNewPrivileges=true
 PrivateTmp=true
