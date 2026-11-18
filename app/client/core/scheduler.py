@@ -226,12 +226,14 @@ class Scheduler:
         self._action_cond = threading.Condition()
         self._action_in_flight = False
         self._action_holds = 0
+        self._quiesce_seq = 0
 
     @contextlib.contextmanager
     def quiesce(self):
         """Wait for any in-flight signup action to finish and hold new ones until exit."""
         with self._action_cond:
             self._action_holds += 1
+            self._quiesce_seq += 1
             while self._action_in_flight:
                 self._action_cond.wait()
         try:
@@ -331,6 +333,8 @@ class Scheduler:
     # ---- 单次尝试 ----
     def try_once(self) -> AttemptResult:
         res = AttemptResult()
+        with self._action_cond:
+            quiesce_seq = self._quiesce_seq
         if self.stop_flag.is_set():
             res.reason = "守护已停止"
             return res
@@ -352,6 +356,9 @@ class Scheduler:
             with self._action_cond:
                 if not self._wait_if_held_locked():
                     res.reason = "守护已停止"
+                    return res
+                if self._quiesce_seq != quiesce_seq:
+                    res.reason = "取消核查期间采样已作废，下轮重新查询"
                     return res
             # 「已报名」，以及**已报名账号进入签到阶段**后的「签到中」。
             # 后者是实测结论（见 sveapi.is_already_in_status 的证据）：
@@ -382,6 +389,9 @@ class Scheduler:
         with self._action_cond:
             if not self._wait_if_held_locked():
                 res.reason = "守护已停止"
+                return res
+            if self._quiesce_seq != quiesce_seq:
+                res.reason = "取消核查期间采样已作废，下轮重新查询"
                 return res
             self._action_in_flight = True
         try:

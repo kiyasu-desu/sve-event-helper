@@ -103,7 +103,7 @@ def _no_cache(resp):
 STATE = {
     "active": None,          # default account_id; browser choice is a per-client cookie
     "accounts": {},          # account_id -> Account
-    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "cancel_epochs": {}, "record_epochs": {}, "login_intents": {}, "storage_failed": False,
+    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "deferred_restores": set(), "cancel_epochs": {}, "record_epochs": {}, "login_intents": {}, "storage_failed": False,
     # 订阅以 "(account_id, 赛事id)" 为键，不依赖可变昵称。
     # 早先用赛事id 作键，导致换账号后订阅被"改绑"，这是错误的。
     "subs": {},              # sub_key -> {account, uid, tournament_id, ..., logs: []}
@@ -171,7 +171,10 @@ RECORDS_REFRESHING = {"flag": False}
 # Guardrails for batch cancellation: stay under AgentLink.endpoint()'s 90s proxy timeout
 # even if the final in-flight item hits upstream detail+cancel timeouts, and serialize
 # explicit enrollments with cancellations on the same (account_id, tournament_id) key.
-BATCH_CANCEL_BUDGET = 40.0
+BATCH_CANCEL_BUDGET = 35.0
+BATCH_CANCEL_VERIFY_BUDGET = 60.0
+BATCH_CANCEL_RECONCILE_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
+_RECONCILE_THREADS = set()
 _PAIR_LOCK_GUARD = threading.Lock()
 _PAIR_LOCKS = {}
 
@@ -448,8 +451,10 @@ def _start_scheduler_for(key: str, s: dict, acc) -> bool:
     STORE._require_writer()
     with LOCK:
         if (remote_enabled() or not s.get("enabled", True) or STATE["subs"].get(key) is not s
-                or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")
-                or key in STATE.get("batch_cancel_keys", {})):
+                or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")):
+            return False
+        if key in STATE.get("batch_cancel_keys", {}):
+            STATE.setdefault("deferred_restores", set()).add(key)
             return False
         if key in STATE["workers"] and key not in STATE["schedulers"]:
             return False
@@ -470,8 +475,10 @@ def _start_scheduler_for(key: str, s: dict, acc) -> bool:
                           **sched_params())
         with LOCK:
             if (remote_enabled() or STATE["subs"].get(key) is not s
-                    or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")
-                    or key in STATE.get("batch_cancel_keys", {})):
+                    or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")):
+                return False
+            if key in STATE.get("batch_cancel_keys", {}):
+                STATE.setdefault("deferred_restores", set()).add(key)
                 return False
             if key in STATE["schedulers"]:      # 竞态兜底：别起第二个
                 s["orphan"] = False
@@ -2185,6 +2192,59 @@ def _check_cancel_subscribe_conflict_locked(key: str, expected_epoch=None):
     return None
 
 
+class _QuiesceLease:
+    """Tracks ownership of a key's quiesce ExitStack and batch_cancel_keys hold."""
+
+    def __init__(self, key: str, stack: contextlib.ExitStack, candidates: list):
+        self.key = key
+        self.stack = stack
+        self.candidates = candidates
+        self.handed_off = False
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        _release_quiesce_state(self.key, self.stack)
+
+
+def _release_quiesce_state(key: str, stack: contextlib.ExitStack) -> None:
+    """Close quiesce holds and retry any scheduler restore deferred during cancel."""
+    retry = None
+    try:
+        stack.close()
+    finally:
+        with LOCK:
+            holds = STATE.get("batch_cancel_keys")
+            still_held = False
+            if holds and key in holds:
+                if holds[key] <= 1:
+                    holds.pop(key, None)
+                else:
+                    holds[key] -= 1
+                    still_held = True
+            if not still_held:
+                deferred = STATE.get("deferred_restores")
+                if deferred is not None and key in deferred:
+                    deferred.discard(key)
+                    s = STATE["subs"].get(key)
+                    if (not remote_enabled() and s is not None and s.get("enabled", True)
+                            and key not in STATE["schedulers"]):
+                        acc = STATE["accounts"].get(s.get("account_id"))
+                        if acc is not None and not acc.__dict__.get("_retired"):
+                            retry = (s, acc)
+    if retry is not None:
+        s, acc = retry
+        try:
+            if _start_scheduler_for(key, s, acc):
+                with LOCK:
+                    persist_subs()
+                log("取消保护解除，已恢复待启动守护：%s" % key)
+        except Exception as e:
+            log("恢复待启动守护失败 %s：%s" % (key, e))
+
+
 @contextlib.contextmanager
 def _quiesce_subscription(key: str):
     """Coordinate with any active/exiting scheduler action for `key` during cancellation."""
@@ -2199,23 +2259,203 @@ def _quiesce_subscription(key: str):
             if candidate is not None and all(candidate is not existing for existing in candidates):
                 candidates.append(candidate)
     stack = contextlib.ExitStack()
+    for sched in candidates:
+        quiesce = getattr(sched, "quiesce", None)
+        if callable(quiesce):
+            cm = quiesce()
+            if hasattr(type(cm), "__enter__") and hasattr(type(cm), "__exit__"):
+                stack.enter_context(cm)
+    lease = _QuiesceLease(key, stack, candidates)
     try:
-        for sched in candidates:
-            quiesce = getattr(sched, "quiesce", None)
-            if callable(quiesce):
-                cm = quiesce()
-                if hasattr(type(cm), "__enter__") and hasattr(type(cm), "__exit__"):
-                    stack.enter_context(cm)
-        yield candidates
+        yield lease
     finally:
-        stack.close()
-        with LOCK:
-            holds = STATE.get("batch_cancel_keys")
-            if holds and key in holds:
-                if holds[key] <= 1:
-                    holds.pop(key, None)
+        if not lease.handed_off:
+            lease.release()
+
+
+def _is_ambiguous_cancel_error(err: SveError) -> bool:
+    if err.code in ("identity_mismatch", "account_deleted"):
+        return False
+    if err.http is not None and 400 <= err.http < 500:
+        return False
+    return err.code is None or err.http is None or err.http >= 500
+
+
+def _has_cancel_guard_state(key: str, candidates: list) -> bool:
+    with LOCK:
+        return bool(
+            candidates
+            or key in STATE["subs"]
+            or key in STATE["schedulers"]
+            or key in STATE["workers"]
+            or key in STATE.get("deferred_restores", ())
+        )
+
+
+def _finalize_cancelled_subscription(key: str, after: str, nm: str, aid: str, tid: str, candidates: list) -> None:
+    """Apply Rule B cleanup and stop schedulers before quiesce hold is released."""
+    stopped = []
+    sub = None
+    with LOCK:
+        dirty = False
+        if key in STATE["schedulers"] or key in STATE["subs"]:
+            popped = STATE["schedulers"].pop(key, None)
+            if popped is not None:
+                stopped.append(popped)
+            sub = STATE["subs"].pop(key, None)
+            dirty = True
+        for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *candidates):
+            if candidate is not None and all(candidate is not existing for existing in stopped):
+                stopped.append(candidate)
+        deferred = STATE.get("deferred_restores")
+        if deferred is not None:
+            deferred.discard(key)
+        rec = STATE["records"].get(key)
+        _bump_record_epoch_locked(key)
+        if rec is not None:
+            rec["status"] = after or "已取消"
+            rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            rec["checked_at"] = time.time()
+            dirty = True
+        if dirty:
+            persist_dataset()
+    for sched in stopped:
+        sched.stop()
+    if sub or stopped:
+        log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
+
+
+def _verify_cancel_outcome(c: SveClient, tid: str, cancel_err, deadline: float, verify_deadline: float):
+    """Verify post-cancel state within proxy timeout bounds.
+
+    Returns (ok2, why, after, uncertain, hit_deadline).
+    """
+    if cancel_err is not None and not _is_ambiguous_cancel_error(cancel_err):
+        return False, str(cancel_err), None, False, time.monotonic() >= deadline
+
+    hit_deadline = time.monotonic() >= deadline
+    if time.monotonic() >= verify_deadline:
+        why = str(cancel_err) if cancel_err is not None else "取消后达到请求时限，状态待后台确认"
+        return False, why, None, True, True
+
+    after = None
+    try:
+        it2 = c.detail(tid)
+        after = it2.get("zh_user_status")
+        if cancel_err is None and after in ("已报名", "已预约"):
+            if time.monotonic() < deadline and time.monotonic() < verify_deadline:
+                time.sleep(0.5)
+                if time.monotonic() < verify_deadline:
+                    it2 = c.detail(tid)
+                    after = it2.get("zh_user_status")
                 else:
-                    holds[key] -= 1
+                    return False, "取消后达到请求时限，状态待后台确认", after, True, True
+            else:
+                return False, "提交后复核状态仍为 %r" % after, after, True, True
+    except SveError as ver_err:
+        if time.monotonic() >= deadline:
+            hit_deadline = True
+        why = str(cancel_err) if cancel_err is not None else ("提交后复核失败：%s" % ver_err)
+        return False, why, after, True, hit_deadline
+
+    if after not in ("已报名", "已预约"):
+        return True, "", after, False, hit_deadline or time.monotonic() >= deadline
+    if cancel_err is not None:
+        return False, str(cancel_err), after, False, hit_deadline or time.monotonic() >= deadline
+    return False, "提交后复核状态仍为 %r" % after, after, False, hit_deadline or time.monotonic() >= deadline
+
+
+def _spawn_cancel_reconciler(key: str, acc, tid: str, nm: str, lease: _QuiesceLease) -> None:
+    """Keep scheduler/subscription quiesced until upstream cancel outcome is resolved."""
+    lease.handed_off = True
+
+    def reconcile():
+        wait_evt = threading.Event()
+        resolved = False
+        after = None
+        retired = False
+        try:
+            c = SveClient(acc)
+            for delay in BATCH_CANCEL_RECONCILE_DELAYS:
+                with LOCK:
+                    if acc.__dict__.get("_retired") or STATE["accounts"].get(acc.account_id) is not acc:
+                        retired = True
+                        break
+                    if (key not in STATE["subs"] and key not in STATE["schedulers"]
+                            and key not in STATE["workers"] and key not in STATE.get("deferred_restores", ())):
+                        break
+                wait_evt.wait(delay)
+                try:
+                    it = c.detail(tid)
+                    after = it.get("zh_user_status")
+                    resolved = True
+                    break
+                except SveError:
+                    continue
+
+            if retired:
+                return
+            if resolved:
+                if after not in ("已报名", "已预约"):
+                    _finalize_cancelled_subscription(key, after, nm, acc.account_id, tid, lease.candidates)
+                    log("批量取消后台核查确认已取消：%s（%s）@ %s" % (nm, tid, acc.account_id))
+                else:
+                    with LOCK:
+                        rec = STATE["records"].get(key)
+                        if rec is not None:
+                            _bump_record_epoch_locked(key)
+                            rec["status"] = after
+                            rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            rec["checked_at"] = time.time()
+                            persist_dataset()
+                return
+
+            # Upstream remained unreachable through retries: fail closed so the scheduler
+            # cannot resume and re-enroll after an already-applied cancellation.
+            stopped = []
+            paused = False
+            with LOCK:
+                popped = STATE["schedulers"].pop(key, None)
+                if popped is not None:
+                    stopped.append(popped)
+                for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *lease.candidates):
+                    if candidate is not None and all(candidate is not existing for existing in stopped):
+                        stopped.append(candidate)
+                s = STATE["subs"].get(key)
+                if s is not None:
+                    s["enabled"] = False
+                    paused = True
+                deferred = STATE.get("deferred_restores")
+                if deferred is not None:
+                    deferred.discard(key)
+                rec = STATE["records"].get(key)
+                if rec is not None:
+                    _bump_record_epoch_locked(key)
+                    rec["checked_at"] = 0.0
+                if stopped or paused or rec is not None:
+                    persist_dataset()
+            for sched in stopped:
+                sched.stop()
+            if stopped or paused:
+                _sub_log(key, "批量取消后状态复核超时，已暂停守护防误重报，请确认官方状态")
+                log("批量取消复核超时，已暂停订阅防重报：%s（%s）@ %s" % (nm, tid, acc.account_id))
+        except Exception as e:
+            log("批量取消后台核查异常 %s：%s" % (key, e))
+        finally:
+            lease.release()
+            with LOCK:
+                _RECONCILE_THREADS.discard(threading.current_thread())
+
+    thread = threading.Thread(target=reconcile, daemon=True, name="cancel-reconcile-%s" % key)
+    with LOCK:
+        _RECONCILE_THREADS.add(thread)
+    try:
+        thread.start()
+    except Exception:
+        lease.handed_off = False
+        with LOCK:
+            _RECONCILE_THREADS.discard(thread)
+        raise
 
 
 def _batch_cancel_timeout_row(aid: str, tid: str, *, name: str = "", submitted: bool = False) -> dict:
@@ -2240,7 +2480,9 @@ def api_batch_cancel():
     if err is not None:
         return err
 
-    deadline = time.monotonic() + BATCH_CANCEL_BUDGET
+    started = time.monotonic()
+    deadline = started + BATCH_CANCEL_BUDGET
+    verify_deadline = started + BATCH_CANCEL_VERIFY_BUDGET
     timed_out = False
     results = []
     for aid in accts:
@@ -2267,10 +2509,12 @@ def api_batch_cancel():
                     timed_out = True
                     results.append(_batch_cancel_timeout_row(aid, tid))
                     continue
-                with _quiesce_subscription(key) as sched_candidates:
+                with _quiesce_subscription(key) as lease:
                     try:
                         it = c.detail(tid)
                     except SveError as e:
+                        if time.monotonic() >= deadline:
+                            timed_out = True
                         results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
                                         "result": "fail", "reason": str(e)})
                         continue
@@ -2286,57 +2530,27 @@ def api_batch_cancel():
                         timed_out = True
                         results.append(_batch_cancel_timeout_row(aid, tid, name=nm, submitted=True))
                         continue
+                    cancel_err = None
                     try:
                         c.cancel(tid)
                     except SveError as e:
-                        results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                        "name": nm, "result": "fail", "reason": str(e)})
-                        continue
-                    ok2, why, after = False, "", None
-                    try:
-                        it2 = c.detail(tid)
-                        after = it2.get("zh_user_status")
-                        if after in ("已报名", "已预约"):
-                            time.sleep(0.5)
-                            it2 = c.detail(tid)
-                            after = it2.get("zh_user_status")
-                        ok2 = after not in ("已报名", "已预约")
-                        if not ok2:
-                            why = "提交后复核状态仍为 %r" % after
-                    except SveError as e:
-                        why = "提交后复核失败：%s" % e
+                        cancel_err = e
+                    ok2, why, after, uncertain, hit_deadline = _verify_cancel_outcome(
+                        c, tid, cancel_err, deadline, verify_deadline
+                    )
+                    if hit_deadline:
+                        timed_out = True
                     results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
                                     "name": nm, "result": "ok" if ok2 else "fail",
                                     "reason": "" if ok2 else why})
                     if ok2:
                         # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
-                        stopped = []
-                        sub = None
-                        with LOCK:
-                            dirty = False
-                            if key in STATE["schedulers"] or key in STATE["subs"]:
-                                popped = STATE["schedulers"].pop(key, None)
-                                if popped is not None:
-                                    stopped.append(popped)
-                                sub = STATE["subs"].pop(key, None)
-                                dirty = True
-                            for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *sched_candidates):
-                                if candidate is not None and all(candidate is not existing for existing in stopped):
-                                    stopped.append(candidate)
-                            rec = STATE["records"].get(key)
-                            _bump_record_epoch_locked(key)
-                            if rec is not None:
-                                rec["status"] = after or "已取消"
-                                rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                                rec["checked_at"] = time.time()
-                                dirty = True
-                            if dirty:
-                                persist_dataset()
-                        for sched in stopped:
-                            sched.stop()
-                        if sub or stopped:
-                            log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
-                    log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
+                        _finalize_cancelled_subscription(key, after, nm, aid, tid, lease.candidates)
+                    elif uncertain and _has_cancel_guard_state(key, lease.candidates):
+                        _spawn_cancel_reconciler(key, acc, tid, nm, lease)
+                    log("批量取消：%s → %s（%s）" % (
+                        aid, nm, "成功" if ok2 else ("待后台核查" if uncertain else "复核未通过")
+                    ))
 
     return _batch_response("批量取消", results)
 

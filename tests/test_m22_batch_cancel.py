@@ -91,6 +91,7 @@ class BatchCancelTests(unittest.TestCase):
         self.patches.enter_context(srv.WriterLock(self.data))
         self.patches.enter_context(patch.object(srv, "ACCOUNTS_LOADED_OK", True))
         self.patches.enter_context(patch.object(srv, "log"))
+        self._real_restore_missing_schedulers = srv.restore_missing_schedulers
         self.patches.enter_context(patch.object(srv, "restore_missing_schedulers"))
         notify = self.patches.enter_context(patch.object(srv, "send_notify", side_effect=AssertionError("Unexpected notification")))
         self.addCleanup(notify.assert_not_called)
@@ -111,6 +112,7 @@ class BatchCancelTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            deferred_restores=set(),
             cancel_epochs={},
             record_epochs={},
             pending=[],
@@ -128,6 +130,9 @@ class BatchCancelTests(unittest.TestCase):
         def _cleanup_refresh():
             with srv.LOCK:
                 srv.RECORDS_REFRESHING["flag"] = False
+                threads = list(srv._RECONCILE_THREADS)
+            for t in threads:
+                t.join(timeout=3)
 
         self.addCleanup(_cleanup_refresh)
         srv.persist_accounts()
@@ -371,7 +376,8 @@ class BatchCancelTests(unittest.TestCase):
                 raise srv.SveError("test-cancel-fail")
 
         with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
-                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel), \
+                patch.object(srv, "_spawn_cancel_reconciler") as spawn_reconciler:
             res = self.post("/api/batch_cancel", {
                 "account_ids": ["10001"],
                 "tournaments": ["test-d-err", "test-c-err", "test-v1-err", "test-v2-err", "test-good"],
@@ -386,6 +392,7 @@ class BatchCancelTests(unittest.TestCase):
         self.assertEqual(("fail", "提交后复核失败：test-verify-2"), (by_tid["test-v2-err"]["result"], by_tid["test-v2-err"]["reason"]))
         self.assertEqual("ok", by_tid["test-good"]["result"])
         self.sleep.assert_called_once_with(0.5)
+        self.assertEqual(["10001|test-v1-err", "10001|test-v2-err"], [c.args[0] for c in spawn_reconciler.call_args_list])
 
         for failed_tid in ("test-d-err", "test-c-err", "test-v1-err", "test-v2-err"):
             key = "10001|" + failed_tid
@@ -531,6 +538,7 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         self.patches.enter_context(srv.WriterLock(self.data))
         self.patches.enter_context(patch.object(srv, "ACCOUNTS_LOADED_OK", True))
         self.patches.enter_context(patch.object(srv, "log"))
+        self._real_restore_missing_schedulers = srv.restore_missing_schedulers
         self.patches.enter_context(patch.object(srv, "restore_missing_schedulers"))
         self.patches.enter_context(patch.object(srv, "dispatch_notification"))
         self.patches.enter_context(patch.object(srv.SveClient, "info"))
@@ -547,6 +555,7 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            deferred_restores=set(),
             cancel_epochs={},
             record_epochs={},
             pending=[],
@@ -564,6 +573,9 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         def _cleanup_refresh():
             with srv.LOCK:
                 srv.RECORDS_REFRESHING["flag"] = False
+                threads = list(srv._RECONCILE_THREADS)
+            for t in threads:
+                t.join(timeout=3)
 
         self.addCleanup(_cleanup_refresh)
         srv.persist_accounts()
@@ -1536,6 +1548,323 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             self.assertFalse(sched._action_in_flight)
         with sched.quiesce():
             pass
+
+    def _wait_for_reconcile_idle(self, timeout: float = 5.0):
+        srv = self.srv
+        wait_evt = threading.Event()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with srv.LOCK:
+                if not srv._RECONCILE_THREADS:
+                    return
+            wait_evt.wait(0.01)
+        self.fail("Timed out waiting for cancel reconcilers to finish")
+
+    def test_post_cancel_verification_bounded_by_batch_deadline(self):
+        srv = self.srv
+        tid = "test-verify-budget"
+        detail_calls = []
+
+        def slow_cancel_past_deadline(client, qtid):
+            threading.Event().wait(0.07)
+
+        def detail_still_registered(client, qtid):
+            detail_calls.append(qtid)
+            return {"name": qtid, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
+
+        # Case 1: cancel exceeds BATCH_CANCEL_BUDGET (0.04) but stays under VERIFY_BUDGET (0.15):
+        # at most ONE verification detail() executes; 0.5s second retry is skipped.
+        with patch.object(srv, "BATCH_CANCEL_BUDGET", 0.04), \
+                patch.object(srv, "BATCH_CANCEL_VERIFY_BUDGET", 0.25), \
+                patch.object(srv, "BATCH_CANCEL_RECONCILE_DELAYS", (0.01,)), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail_still_registered), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=slow_cancel_past_deadline):
+            started = time.monotonic()
+            res1 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid, "test-second"]})
+            elapsed1 = time.monotonic() - started
+
+        self._wait_for_reconcile_idle()
+        self.assertLess(elapsed1, 0.25)
+        self.assertEqual(["fail", "fail"], [r["result"] for r in res1["results"]])
+        self.assertEqual([tid, tid], detail_calls[:2])  # preflight + single bounded verify only
+        self.assertNotIn("test-second", detail_calls)
+        self.assertIn("未执行", res1["results"][1]["reason"])
+
+        # Case 2: cancel exceeds BATCH_CANCEL_VERIFY_BUDGET: zero verification detail calls run.
+        detail_calls.clear()
+
+        def slow_cancel_past_verify_budget(client, qtid):
+            threading.Event().wait(0.10)
+
+        with patch.object(srv, "BATCH_CANCEL_BUDGET", 0.03), \
+                patch.object(srv, "BATCH_CANCEL_VERIFY_BUDGET", 0.06), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail_still_registered), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=slow_cancel_past_verify_budget):
+            started = time.monotonic()
+            res2 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            elapsed2 = time.monotonic() - started
+
+        self.assertLess(elapsed2, 0.25)
+        self.assertEqual("fail", res2["results"][0]["result"])
+        self.assertIn("待后台确认", res2["results"][0]["reason"])
+        self.assertEqual([tid], detail_calls)
+
+    def test_ambiguous_cancel_error_rechecks_and_cleans_up_if_cancelled(self):
+        srv = self.srv
+        key, tid = "10001|test-ambig-cancel", "test-ambig-cancel"
+        srv.STATE["records"][key] = {
+            "account_id": "10001", "account": "10001", "uid": 10001,
+            "tournament_id": tid, "name": tid, "source": "测试",
+            "status": "已报名", "at": "2026-01-01 00:00:00",
+            "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
+        }
+        state_lock = threading.Lock()
+        server_state = {"status": "已报名"}
+        sample_seen = threading.Event()
+        release_sample = threading.Event()
+        self.addCleanup(release_sample.set)
+
+        def on_event(kind, data):
+            if kind == "sample":
+                sample_seen.set()
+                release_sample.wait(timeout=5)
+
+        sched, thread = self._setup_scheduler(key, tid, on_event=on_event)
+
+        def detail(client, qtid):
+            if client is sched.client:
+                return {"name": tid, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8}
+            with state_lock:
+                return {"name": tid, "zh_user_status": server_state["status"], "player_num": 1, "max_player_number": 8}
+
+        def cancel_drop_after_apply(client, qtid):
+            with state_lock:
+                server_state["status"] = "可报名"
+            raise srv.SveError("网络请求失败: timed out")
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel_drop_after_apply), \
+                patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not re-signup")):
+            thread.start()
+            self.assertTrue(sample_seen.wait(timeout=5))
+
+            res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            release_sample.set()
+            thread.join(timeout=5)
+
+        self.assertEqual("ok", res["results"][0]["result"])
+        self.assertNotIn(key, srv.STATE["subs"])
+        self.assertNotIn(key, srv.STATE["schedulers"])
+        self.assertTrue(sched.stop_flag.is_set())
+        self.assertEqual("可报名", srv.STATE["records"][key]["status"])
+
+    def test_uncertain_cancel_verification_holds_quiesce_until_reconciler_resolves(self):
+        srv = self.srv
+        # Subcase A: upstream accepted cancel, verification fails initially, reconciler sees 可报名 -> stops sub.
+        key, tid = "10001|test-reconcile-ok", "test-reconcile-ok"
+        srv.STATE["records"][key] = {
+            "account_id": "10001", "account": "10001", "uid": 10001,
+            "tournament_id": tid, "name": tid, "source": "测试",
+            "status": "已报名", "at": "2026-01-01 00:00:00",
+            "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
+        }
+        state_lock = threading.Lock()
+        server_state = {"status": "已报名", "detail_up": True}
+        sample_seen = threading.Event()
+        release_sample = threading.Event()
+        self.addCleanup(release_sample.set)
+
+        def on_event(kind, data):
+            if kind == "sample":
+                sample_seen.set()
+                release_sample.wait(timeout=5)
+
+        sched, thread = self._setup_scheduler(key, tid, on_event=on_event)
+
+        def detail(client, qtid):
+            if client is sched.client:
+                return {"name": tid, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8}
+            with state_lock:
+                if not server_state["detail_up"]:
+                    raise srv.SveError("verify-timeout")
+                return {"name": tid, "zh_user_status": server_state["status"], "player_num": 1, "max_player_number": 8}
+
+        def cancel(client, qtid):
+            with state_lock:
+                server_state["status"] = "可报名"
+                server_state["detail_up"] = False
+
+        with patch.object(srv, "BATCH_CANCEL_RECONCILE_DELAYS", (0.08, 0.08)), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel), \
+                patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not signup")):
+            thread.start()
+            self.assertTrue(sample_seen.wait(timeout=5))
+
+            res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            self.assertEqual("fail", res["results"][0]["result"])
+            # Quiesce hold remains active while status is uncertain.
+            with sched._action_cond:
+                self.assertGreater(sched._action_holds, 0)
+            self.assertIn(key, srv.STATE["batch_cancel_keys"])
+
+            # Release scheduler past sample(): it stays blocked at quiesce and does NOT signup.
+            release_sample.set()
+            threading.Event().wait(0.03)
+            with sched._action_cond:
+                self.assertGreater(sched._action_holds, 0)
+
+            # Upstream recovers reporting 可报名 -> reconciler cleans up subscription & stops scheduler.
+            with state_lock:
+                server_state["detail_up"] = True
+            self._wait_for_reconcile_idle()
+            thread.join(timeout=5)
+
+        self.assertTrue(sched.stop_flag.is_set())
+        self.assertNotIn(key, srv.STATE["subs"])
+        self.assertNotIn(key, srv.STATE["batch_cancel_keys"])
+        self.assertEqual("可报名", srv.STATE["records"][key]["status"])
+
+        # Subcase B: upstream remained 已报名 -> reconciler releases quiesce, scheduler drops stale pre-quiesce sample.
+        key2, tid2 = "10001|test-reconcile-keep", "test-reconcile-keep"
+        acc = srv.STATE["accounts"]["10001"]
+        sched2 = srv.Scheduler(srv.SveClient(acc), tid2, second_confirm_delay=0,
+                               confirm_window=1, confirm_retry=0.01)
+        srv.STATE["subs"][key2] = {"account_id": "10001", "uid": 10001, "tournament_id": tid2, "name": tid2}
+        srv.STATE["schedulers"][key2] = sched2
+
+        with srv.LOCK:
+            lease_box = {}
+        try_result = {}
+        state_b = {"phase": 0}
+
+        def detail_b(client, qtid):
+            if client is sched2.client:
+                return {"name": tid2, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8}
+            state_b["phase"] += 1
+            if state_b["phase"] == 1:
+                return {"name": tid2, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
+            if state_b["phase"] == 2:
+                raise srv.SveError("temp-timeout")
+            return {"name": tid2, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
+
+        def on_event_b(kind, data):
+            if kind == "sample":
+                # Enter batch_cancel right while sched2 has stale 可报名 sample in hand.
+                with patch.object(srv, "BATCH_CANCEL_RECONCILE_DELAYS", (0.04,)):
+                    try_result["cancel_res"] = self._post(
+                        "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid2]}
+                    )
+
+        sched2.on_event = on_event_b
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail_b), \
+                patch.object(srv.SveClient, "cancel", side_effect=srv.SveError("网络请求失败")), \
+                patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not signup on stale sample")):
+            attempt_res = sched2.try_once()
+        self._wait_for_reconcile_idle()
+        self.assertIn("已作废", attempt_res.reason)
+        self.assertIn(key2, srv.STATE["subs"])
+        self.assertNotIn(key2, srv.STATE["batch_cancel_keys"])
+        self.assertFalse(sched2.stop_flag.is_set())
+
+        # Subcase C: upstream stays unreachable across all retries -> reconciler fails closed & disables sub.
+        key3, tid3 = "10001|test-reconcile-failclosed", "test-reconcile-failclosed"
+        sched3, thread3 = self._setup_scheduler(key3, tid3)
+        calls3 = {"n": 0}
+
+        def detail_unreachable(client, qtid):
+            calls3["n"] += 1
+            if calls3["n"] == 1:
+                return {"name": tid3, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
+            raise srv.SveError("still-down")
+
+        with patch.object(srv, "BATCH_CANCEL_RECONCILE_DELAYS", (0.01, 0.01)), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail_unreachable), \
+                patch.object(srv.SveClient, "cancel", return_value={}):
+            res3 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid3]})
+            self._wait_for_reconcile_idle()
+        self.assertEqual("fail", res3["results"][0]["result"])
+        self.assertTrue(sched3.stop_flag.is_set())
+        self.assertFalse(srv.STATE["subs"][key3]["enabled"])
+        self.assertNotIn(key3, srv.STATE["schedulers"])
+        self.assertNotIn(key3, srv.STATE["batch_cancel_keys"])
+
+    def test_restore_missing_schedulers_retries_after_batch_cancel_hold_releases(self):
+        srv = self.srv
+        key1, tid1 = "10001|test-restore-skip", "test-restore-skip"
+        key2, tid2 = "10001|test-restore-ok", "test-restore-ok"
+
+        for key, tid, init_status, after_status, should_restore in (
+            (key1, tid1, "可报名", "可报名", True),
+            (key2, tid2, "已报名", "可报名", False),
+        ):
+            srv.STATE["subs"] = {
+                key: {
+                    "account_id": "10001", "account": "10001", "uid": 10001,
+                    "tournament_id": tid, "name": tid, "enabled": True,
+                }
+            }
+            srv.persist_subs()
+            detail_entered = threading.Event()
+            release_detail = threading.Event()
+            cancelled = threading.Event()
+            self.addCleanup(release_detail.set)
+
+            def detail(client, qtid, *, init=init_status, after=after_status, de=detail_entered, rd=release_detail, cx=cancelled):
+                if qtid == tid and threading.current_thread().name.startswith("restore-cancel"):
+                    if not de.is_set():
+                        de.set()
+                        rd.wait(timeout=5)
+                    return {"name": qtid, "zh_user_status": after if cx.is_set() else init,
+                            "player_num": 1, "max_player_number": 8}
+                return {"name": qtid, "zh_user_status": "未报名", "player_num": 1, "max_player_number": 8}
+
+            def cancel(client, qtid, *, cx=cancelled):
+                cx.set()
+
+            with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                    patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+                box = {}
+                t = threading.Thread(
+                    target=lambda: box.__setitem__("res", self._post(
+                        "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                    )),
+                    daemon=True,
+                    name=f"restore-cancel-{tid}",
+                )
+                t.start()
+                self.addCleanup(lambda k=key, rd=release_detail, th=t: (
+                    rd.set(),
+                    th.join(timeout=3),
+                    srv.STATE["schedulers"][k].stop() if k in srv.STATE["schedulers"] else None,
+                    srv.STATE["workers"][k].join(timeout=3)
+                    if (k in srv.STATE["workers"] and srv.STATE["workers"][k].ident is not None) else None,
+                ))
+                self.assertTrue(detail_entered.wait(timeout=5))
+
+                started_during_hold = self._real_restore_missing_schedulers("test")
+                self.assertEqual(0, started_during_hold)
+                if should_restore:
+                    self.assertIn(key, srv.STATE["deferred_restores"])
+                self.assertNotIn(key, srv.STATE["schedulers"])
+
+                release_detail.set()
+                t.join(timeout=5)
+
+            if should_restore:
+                self.assertEqual("skip", box["res"]["results"][0]["result"])
+                self.assertIn(key, srv.STATE["schedulers"])
+                self.assertNotIn(key, srv.STATE["deferred_restores"])
+                sched = srv.STATE["schedulers"][key]
+                worker = srv.STATE["workers"].get(key)
+                sched.stop()
+                if worker is not None and worker.ident is not None:
+                    worker.join(timeout=3)
+            else:
+                self.assertEqual("ok", box["res"]["results"][0]["result"])
+                self.assertNotIn(key, srv.STATE["schedulers"])
+                self.assertNotIn(key, srv.STATE["subs"])
+                self.assertNotIn(key, srv.STATE["deferred_restores"])
 
 
 if __name__ == "__main__":
