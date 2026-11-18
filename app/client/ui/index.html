@@ -136,10 +136,12 @@
   .floating-button:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
   #backToTop { right: calc(var(--floating-gap) + env(safe-area-inset-right, 0px));
                font-size: 24px; font-weight: 600; line-height: 1; }
-  #btnBatch { left: calc(var(--floating-gap) + env(safe-area-inset-left, 0px));
-              width: var(--batch-size); height: var(--batch-size); font-size: 1rem;
-              font-weight: 600; line-height: 1.15; white-space: pre-line; }
-  #btnBatch:disabled { opacity: .65; cursor: wait; }
+  #btnBatch, #btnBatchCancel { left: calc(var(--floating-gap) + env(safe-area-inset-left, 0px));
+                              width: var(--batch-size); height: var(--batch-size); font-size: 1rem;
+                              font-weight: 600; line-height: 1.15; white-space: pre-line; }
+  #btnBatchCancel { bottom: calc(var(--floating-bottom) + var(--batch-size) + 12px);
+                    background: var(--err); border-color: var(--err); color: #06121f; }
+  #btnBatch:disabled, #btnBatchCancel:disabled { opacity: .65; cursor: wait; }
 /* 行内动作按钮固定最小宽度：文案在「订阅 / 取消订阅 / 处理中…」之间切换时
    不得改变宽度，否则卡片内会横向位移，相邻元素跟着抖（实测会导致误点）。 */
 button.small.act { min-width: 84px; text-align: center; }
@@ -218,7 +220,7 @@ button.small.act { min-width: 84px; text-align: center; }
     padding-bottom: calc(var(--floating-bottom) + var(--floating-size) + var(--floating-gap));
   }
   #eventsPage {
-    padding-bottom: calc(var(--floating-bottom) + var(--batch-size) + var(--floating-gap));
+    padding-bottom: calc(var(--floating-bottom) + var(--batch-size) * 2 + 12px + var(--floating-gap));
   }
   #subsPage a { color:var(--accent); }
   .subs-toolbar { display:flex; align-items:center; gap:8px 14px; flex-wrap:wrap; margin-bottom:10px; }
@@ -409,6 +411,7 @@ button.small.act { min-width: 84px; text-align: center; }
 <div id="ptr" aria-hidden="true"></div>
 <span id="ptrStatus" role="status"></span>
 <button id="backToTop" class="floating-button" type="button" aria-label="返回顶部" hidden>↑</button>
+<button id="btnBatchCancel" class="floating-button" type="button" aria-label="一键取消" hidden disabled>一键&#10;取消</button>
 <button id="btnBatch" class="floating-button" type="button" aria-label="一键报名" hidden disabled>一键&#10;报名</button>
 
 <script>
@@ -1531,14 +1534,15 @@ async function startLogin(options = {}) {
 
 $("btnLogin").onclick = () => startLogin();
 
-// ------------------------------------------------------------------ 批量报名
-// ⚠️ 这是本工具**唯一会真正改变账号状态**的功能，因此：
+// ------------------------------------------------------------------ 批量操作（报名 / 取消）
+// ⚠️ 这是本工具**唯一会一次性改变多个账号状态**的功能，因此：
 //   * 点击后弹**二次确认**，逐条列出「哪个账号 → 哪场赛事」，让人看清再确认
-//   * 逐项汇总结果（成功 / 跳过（已报名）/ 失败+原因），**中途失败不中断其余**
-//   * 「已报名则跳过」的判定由**服务端**重新查详情得出，不依赖前端缓存
+//   * 逐项汇总结果（成功 / 跳过 / 失败+原因），**中途失败不中断其余**
+//   * 是否跳过（已报名或未报名）的判定由**服务端**重新查详情得出，不依赖前端缓存
 const PICK_ACCTS = new Set();
 const PICK_TOURS = new Set();
 let batchRunning = false;
+let batchAction = null;
 let batchResultOpen = false;
 let batchDialogOrigin;
 
@@ -1574,9 +1578,12 @@ function dismissBatchResult() {
   if (origin.page === currentPage) window.scrollTo(0, origin.scroll);
 }
 
-function showBatchResult(rows) {
+function showBatchResult(rows, mode = "enroll") {
+  const isCancel = mode === "cancel";
   const counts = {ok:0, skip:0, fail:0, pending:0};
-  const labels = {ok:"成功", skip:"已报名，跳过", fail:"失败", pending:"待确认"};
+  const labels = {ok:"成功", skip:isCancel ? "未报名，跳过" : "已报名，跳过", fail:"失败", pending:"待确认"};
+  $("batchTitle").textContent = isCancel ? "批量取消结果" : "批量报名结果";
+  $("batchDetails").setAttribute("aria-label", isCancel ? "逐项取消结果" : "逐项报名结果");
   for (const row of rows) counts[row.result]++;
   $("batchSummary").textContent = `成功 ${counts.ok} · 跳过 ${counts.skip} · 失败 ${counts.fail} · 待确认 ${counts.pending}`;
   $("batchDetails").innerHTML = (counts.pending
@@ -1631,11 +1638,21 @@ function hasBatchSelection() {
 }
 
 function updateBatchButton() {
+  const hidden = !hasBatchSelection() || (!batchRunning && eventActionsUnverified());
+  const enrolling = batchRunning && batchAction !== "cancel";
+  const cancelling = batchRunning && batchAction === "cancel";
+
   const btn = $("btnBatch");
-  btn.hidden = !hasBatchSelection() || (!batchRunning && eventActionsUnverified());
-  btn.disabled = btn.hidden || batchRunning;
-  btn.textContent = batchRunning ? "报名\n中…" : "一键\n报名";
-  btn.setAttribute("aria-label", batchRunning ? "一键报名，提交中" : "一键报名");
+  btn.hidden = hidden;
+  btn.disabled = hidden || batchRunning;
+  btn.textContent = enrolling ? "报名\n中…" : "一键\n报名";
+  btn.setAttribute("aria-label", enrolling ? "一键报名，提交中" : "一键报名");
+
+  const cancelBtn = $("btnBatchCancel");
+  cancelBtn.hidden = hidden;
+  cancelBtn.disabled = hidden || batchRunning;
+  cancelBtn.textContent = cancelling ? "取消\n中…" : "一键\n取消";
+  cancelBtn.setAttribute("aria-label", cancelling ? "一键取消，提交中" : "一键取消");
 }
 
 document.addEventListener("change", (e) => {
@@ -1654,8 +1671,9 @@ function tourName(tid) {
   return t ? t.name : String(tid);
 }
 
-async function batchEnroll() {
+async function runBatchAction(mode) {
   if (batchRunning || !hasBatchSelection() || eventActionsUnverified()) return;
+  const isCancel = mode === "cancel";
   const accts = [...PICK_ACCTS], tours = [...PICK_TOURS];
   const tourNames = new Map(tours.map(id => [id, tourName(id)]));
   const accountNames = new Map(accts.map(id => [id, accountLabel(id)]));
@@ -1664,21 +1682,26 @@ async function batchEnroll() {
   const count = accts.length * tours.length;
 
   const pairs = accts.flatMap(id => tours.map(tid => `　· ${accountLabel(id)} → ${tourNames.get(tid)}`));
-  if (!confirm(
-    `即将执行批量报名\n\n` +
-    `${accts.length} 个账号 × ${tours.length} 场赛事 = ${count} 次提交\n\n` +
-    pairs.join("\n") +
-    `\n\n已报名的会自动跳过。确认执行？`
-  )) return;
+  const confirmText = isCancel
+    ? `即将执行批量取消报名\n\n` +
+      `${accts.length} 个账号 × ${tours.length} 场赛事 = ${count} 次提交\n\n` +
+      pairs.join("\n") +
+      `\n\n未报名的会自动跳过。确认执行？`
+    : `即将执行批量报名\n\n` +
+      `${accts.length} 个账号 × ${tours.length} 场赛事 = ${count} 次提交\n\n` +
+      pairs.join("\n") +
+      `\n\n已报名的会自动跳过。确认执行？`;
+  if (!confirm(confirmText)) return;
 
   const accountId = ACCOUNT_ID, epoch = ACCOUNT_EPOCH;
   batchRunning = true;
+  batchAction = isCancel ? "cancel" : "enroll";
   updateBatchButton();
-  setStatus(`正在批量报名（最多 ${count} 次）…`, "info");
+  setStatus(isCancel ? `正在批量取消（最多 ${count} 次）…` : `正在批量报名（最多 ${count} 次）…`, "info");
   const controller = new AbortController();
   let timeout;
   try {
-    const r = await Promise.race([api("/api/batch_enroll", {
+    const r = await Promise.race([api(isCancel ? "/api/batch_cancel" : "/api/batch_enroll", {
       method: "POST",
       body: JSON.stringify({ account_ids: accts, tournaments: tours }),
       signal: controller.signal,
@@ -1687,7 +1710,7 @@ async function batchEnroll() {
     })]);
     const received = r?.ok && Array.isArray(r.results) ? r.results : [];
     const requestError = r?.ok === false && typeof r.error === "string" ? r.error.trim() : "";
-    // Only these validation codes guarantee that no enrollment was attempted.
+    // Only these validation codes guarantee that no submission was attempted.
     // Proxy errors (including timeouts) may arrive after a partial submission.
     const rejection = requestError && ["batch_selection_required", "batch_limit_exceeded"].includes(r.code);
     // Only an unambiguous response for a requested pair can settle that pair.
@@ -1697,16 +1720,27 @@ async function batchEnroll() {
         String(row.tournament_id) === pair.tournament_id);
       const row = matches.length === 1 ? matches[0] : null;
       const result = row && ["ok", "skip", "fail"].includes(row.result) ? row.result : "pending";
-      return {...pair, result, reason:result === "fail" ? String(row.reason || "报名失败，未提供原因") :
+      return {...pair, result, reason:result === "fail" ? String(row.reason || (isCancel ? "取消失败，未提供原因" : "报名失败，未提供原因")) :
         result === "pending" ? (requestError || "未取得明确结果") : ""};
     });
-    showBatchResult(rows);
+    showBatchResult(rows, batchAction);
 
     // Uncheck successful events before releasing the submit lock or reloading the list.
     if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) {
-      setStatus(`批量报名结果：${$("batchSummary").textContent}`,
+      const prefix = isCancel ? "批量取消结果" : "批量报名结果";
+      setStatus(`${prefix}：${$("batchSummary").textContent}`,
         rows.some(row => row.result === "fail" || row.result === "pending") ? "err" : "ok");
-      for (const row of rows) if (row.result === "ok") PICK_TOURS.delete(row.tournament_id);
+      for (const row of rows) {
+        if (row.result === "ok") {
+          PICK_TOURS.delete(row.tournament_id);
+          if (row.account_id === accountId) {
+            confirmEnroll(row.tournament_id, !isCancel);
+            if (isCancel && (MINE.has(row.tournament_id) || CONFIRMED.has(row.tournament_id))) {
+              confirmUnsubscription(row.tournament_id);
+            }
+          }
+        }
+      }
       document.querySelectorAll('input.pick[data-kind="tour"]:checked').forEach(input => {
         input.checked = PICK_TOURS.has(input.dataset.id);
       });
@@ -1714,12 +1748,17 @@ async function batchEnroll() {
   } finally {
     clearTimeout(timeout);
     batchRunning = false;
+    batchAction = null;
     updateBatchButton();
   }
   if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) await reloadAll();
 }
 
+function batchEnroll() { return runBatchAction("enroll"); }
+function batchCancel() { return runBatchAction("cancel"); }
+
 $("btnBatch").onclick = batchEnroll;
+$("btnBatchCancel").onclick = batchCancel;
 $("btnLoad").onclick = () => queryEvents();
 function changeArea() {
   pendingEventsScroll = null;

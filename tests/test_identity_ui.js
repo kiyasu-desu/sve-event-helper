@@ -12,13 +12,17 @@ function harness(pathname='/') {
   function element() {
     let html='';
     const queried=new Map();
+    const attrs=new Map();
     return {children:[],value:'',textContent:'',style:{},dataset:{},checked:false,
       get innerHTML(){return html;},set innerHTML(value){html=value;this.children=[];},
       classList:{add(){},remove(){},toggle(){},contains(){return false;}},
       events:{},addEventListener(name,fn){this.events[name]=fn;},querySelectorAll(){return [];},
       querySelector(selector){if(!queried.has(selector))queried.set(selector,element());return queried.get(selector);},
       appendChild(child){this.children.push(child);},removeChild(child){this.children.splice(this.children.indexOf(child),1);},
-      focus(){},scrollIntoView(){},replaceWith(){},removeAttribute(){},setAttribute(){},getAttribute(){return null;},
+      focus(){},scrollIntoView(){},replaceWith(){},
+      removeAttribute(name){attrs.delete(name);},
+      setAttribute(name,value){attrs.set(name,String(value));},
+      getAttribute(name){return attrs.has(name)?attrs.get(name):null;},
       firstElementChild:{},hidden:false};
   }
   const context = vm.createContext({console, URL, Map, Set, Date, Promise,
@@ -1014,27 +1018,28 @@ test('all app pages initialize the GitHub entry from the shipped M21 metadata',(
   }
 });
 
-test('M21 PWA activation retires the old shell and online navigation caches the shipped link',async()=>{
+test('PWA activation retires old shells and online navigation caches the shipped link',async()=>{
   const handlers={},deleted=[],stored=[];
   const html=fs.readFileSync('app/client/ui/index.html','utf8');
   const fresh={body:html,clone(){return this;}};
   const c=vm.createContext({URL,
     self:{location:{origin:'https://sve.example.com'},registration:{scope:'https://sve.example.com/'},
       addEventListener(name,fn){handlers[name]=fn;},clients:{async claim(){}}},
-    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell'];},
+    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell'];},
       async delete(key){deleted.push(key);},async open(key){return {async put(req,response){stored.push({key,response});}};},
       async match(){throw Error('online navigation must use the fresh page');}},
     fetch:async()=>fresh});
   vm.runInContext(fs.readFileSync('app/client/ui/sw.js','utf8'),c);
+  assert.equal(vm.runInContext('VERSION',c),'sve-v27-m22-batch-cancel');
   let pending;
   handlers.activate({waitUntil(value){pending=value;}});
   await pending;
-  assert.deepEqual(deleted,['sve-v25-new-repository-shell']);
+  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell']);
   handlers.fetch({request:{method:'GET',mode:'navigate',url:'https://sve.example.com/settings'},
     respondWith(value){pending=value;}});
   assert.equal((await pending).body,html);
   assert.equal(stored.length,1);
-  assert.equal(stored[0].key,'sve-v26-m21-repository-link-shell');
+  assert.equal(stored[0].key,'sve-v27-m22-batch-cancel-shell');
   assert.match(stored[0].response.body,/<meta name="sve-repository" content="https:\/\/github.com\/kiyasu-desu\/sve-event-helper">/);
 });
 
@@ -1695,4 +1700,179 @@ test('manual account selection clears old buttons before its request returns',as
   release({json:async()=>({ok:true})});
   await pending;
   assert.equal(h.run('ACCOUNT_ID'),'10002');
+});
+
+test('batch cancel button mirrors batch enroll visibility and CSS placement',()=>{
+  const html=fs.readFileSync('app/client/ui/index.html','utf8');
+  assert.match(html,/<button id="btnBatchCancel" class="floating-button" type="button" aria-label="一键取消" hidden disabled>一键&#10;取消<\/button>\s*<button id="btnBatch"/);
+  assert.match(html,/#btnBatchCancel\s*\{[^}]*bottom:\s*calc\(var\(--floating-bottom\)\s*\+\s*var\(--batch-size\)\s*\+\s*12px\)[^}]*background:\s*var\(--err\)/);
+  assert.match(html,/#eventsPage\s*\{[^}]*padding-bottom:\s*calc\(var\(--floating-bottom\)\s*\+\s*var\(--batch-size\)\s*\*\s*2\s*\+\s*12px\s*\+\s*var\(--floating-gap\)\)/);
+
+  const h=harness();
+  const enrollBtn=h.elements.get('btnBatch');
+  const cancelBtn=h.elements.get('btnBatchCancel');
+  const change=(kind,id,checked)=>h.events.change({target:{
+    classList:{contains:value=>value==='pick'},dataset:{kind,id},checked
+  }});
+  h.run('currentPage="events"; updateBatchButton();');
+  assert.equal(enrollBtn.hidden,true);
+  assert.equal(cancelBtn.hidden,true);
+  assert.equal(cancelBtn.disabled,true);
+  change('acct','10001',true);
+  assert.equal(cancelBtn.hidden,true);
+  change('tour','test-event',true);
+  assert.equal(enrollBtn.hidden,false);
+  assert.equal(cancelBtn.hidden,false);
+  assert.equal(cancelBtn.disabled,false);
+  assert.equal(cancelBtn.textContent,'一键\n取消');
+  assert.equal(cancelBtn.getAttribute('aria-label'),'一键取消');
+  h.run('currentPage="subs"; updateBatchButton();');
+  assert.equal(cancelBtn.hidden,true);
+  h.run('currentPage="events"; tournamentsUnverified=true; updateBatchButton();');
+  assert.equal(cancelBtn.hidden,true);
+  h.run('tournamentsUnverified=false; updateBatchButton();');
+  assert.equal(cancelBtn.hidden,false);
+});
+
+test('batch enroll and batch cancel mutually disable both buttons and preserve in-flight labels',async()=>{
+  for (const mode of ['enroll','cancel']) {
+    const h=harness();
+    h.run(`currentPage="events"; ACCOUNT_ID="10001";
+      PICK_ACCTS.add("10001"); PICK_TOURS.add("test-event"); reloadAll=async()=>{};`);
+    let release;
+    const calls=[];
+    h.context.fetch=(url)=>{calls.push(url); return new Promise(resolve=>{release=resolve;});};
+    const pending=h.run(mode==='cancel' ? 'batchCancel()' : 'batchEnroll()');
+    await h.run(mode==='cancel' ? 'batchEnroll()' : 'batchCancel()');
+    h.run('updateBatchButton()');
+    assert.equal(calls.length,1);
+    assert.equal(new URL(calls[0],'https://example.com').pathname,mode==='cancel' ? '/api/batch_cancel' : '/api/batch_enroll');
+    const enrollBtn=h.elements.get('btnBatch');
+    const cancelBtn=h.elements.get('btnBatchCancel');
+    assert.equal(enrollBtn.hidden,false);
+    assert.equal(cancelBtn.hidden,false);
+    assert.equal(enrollBtn.disabled,true);
+    assert.equal(cancelBtn.disabled,true);
+    assert.equal(enrollBtn.textContent,mode==='enroll' ? '报名\n中…' : '一键\n报名');
+    assert.equal(enrollBtn.getAttribute('aria-label'),mode==='enroll' ? '一键报名，提交中' : '一键报名');
+    assert.equal(cancelBtn.textContent,mode==='cancel' ? '取消\n中…' : '一键\n取消');
+    assert.equal(cancelBtn.getAttribute('aria-label'),mode==='cancel' ? '一键取消，提交中' : '一键取消');
+    release({json:async()=>({ok:true,results:[{account_id:'10001',tournament_id:'test-event',result:'ok'}]})});
+    await pending;
+    assert.equal(h.run('batchRunning'),false);
+    assert.equal(h.run('batchAction'),null);
+    h.run('closeBatchResult()');
+    assert.equal(enrollBtn.hidden,true);
+    assert.equal(cancelBtn.hidden,true);
+  }
+});
+
+test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, and clears only ok picks',async()=>{
+  const h=harness();
+  h.run(`currentPage="events"; ACCOUNT_ID="10001";
+    ACCOUNT_ROWS=new Map([["10001",{nickname:"test-account",account_id:"10001",version:1}]]);
+    TOURS=[
+      {tournament_id:"test-ok",name:"test-ok-name"},
+      {tournament_id:"test-skip",name:"test-skip-name"},
+      {tournament_id:"test-fail",name:"test-fail-name"}
+    ];
+    PICK_ACCTS.add("10001");
+    PICK_TOURS.add("test-ok"); PICK_TOURS.add("test-skip"); PICK_TOURS.add("test-fail");
+    confirmEnroll("test-ok", true);
+    reloadAll=async()=>{};`);
+  const okPick={checked:true,dataset:{id:'test-ok'}};
+  const skipPick={checked:true,dataset:{id:'test-skip'}};
+  const failPick={checked:true,dataset:{id:'test-fail'}};
+  h.context.document.querySelectorAll=selector=>selector.endsWith(':checked')?[okPick,skipPick,failPick]:[];
+  const confirmations=[];
+  h.context.confirm=message=>{confirmations.push(message);return confirmations.length>1;};
+  const calls=[];
+  h.context.fetch=async(url,opts)=>{
+    calls.push([url,JSON.parse(opts.body)]);
+    return {json:async()=>({ok:true,results:[
+      {account_id:'10001',tournament_id:'test-ok',result:'ok',reason:''},
+      {account_id:'10001',tournament_id:'test-skip',result:'skip',reason:'未报名或不可取消（签到中）'},
+      {account_id:'10001',tournament_id:'test-fail',result:'fail',reason:'test-cancel-failed'},
+    ]})};
+  };
+
+  await h.run('batchCancel()');
+  assert.equal(calls.length,0);
+  assert.match(confirmations[0],/^即将执行批量取消报名/);
+  assert.match(confirmations[0],/1 个账号 × 3 场赛事 = 3 次提交/);
+  assert.match(confirmations[0],/test-account \(UID 10001\) → test-ok-name/);
+  assert.match(confirmations[0],/未报名的会自动跳过。确认执行？$/);
+
+  await h.run('batchCancel()');
+  assert.equal(calls.length,1);
+  assert.equal(new URL(calls[0][0],'https://example.com').pathname,'/api/batch_cancel');
+  assert.deepEqual(calls[0][1],{account_ids:['10001'],tournaments:['test-ok','test-skip','test-fail']});
+  assert.equal(h.elements.get('batchTitle').textContent,'批量取消结果');
+  assert.equal(h.elements.get('batchDetails').getAttribute('aria-label'),'逐项取消结果');
+  assert.match(h.elements.get('batchSummary').textContent,/成功 1 · 跳过 1 · 失败 1 · 待确认 0/);
+  assert.match(h.elements.get('actionStatus').textContent,/^批量取消结果：成功 1/);
+  const detail=h.elements.get('batchDetails').innerHTML;
+  assert.match(detail,/test-ok-name：成功<\/p>/);
+  assert.match(detail,/test-skip-name：未报名，跳过<\/p>/);
+  assert.doesNotMatch(detail,/已报名，跳过|未报名或不可取消/);
+  assert.match(detail,/test-fail-name：失败：test-cancel-failed<\/p>/);
+
+  assert.equal(okPick.checked,false);
+  assert.equal(skipPick.checked,true);
+  assert.equal(failPick.checked,true);
+  assert.deepEqual(Array.from(h.run('PICK_TOURS')),['test-skip','test-fail']);
+  assert.equal(h.run('ENROLLED.get("test-ok")?.want'),false);
+
+  h.run('closeBatchResult()');
+  assert.equal(h.elements.get('btnBatch').disabled,false);
+  assert.equal(h.elements.get('btnBatchCancel').disabled,false);
+
+  // Default single-argument showBatchResult keeps enroll copy.
+  h.run('showBatchResult([{accountLabel:"test-account",tourName:"test-one",result:"skip"}])');
+  assert.equal(h.elements.get('batchTitle').textContent,'批量报名结果');
+  assert.match(h.elements.get('batchDetails').innerHTML,/已报名，跳过/);
+  h.run('closeBatchResult()');
+});
+
+test('batch cancel preserves a late response after switching accounts and unlocks both buttons',async()=>{
+  const h=harness();
+  h.run(`currentPage="events"; ACCOUNT_ID="10001"; PICK_ACCTS.add("10001"); PICK_TOURS.add("test-event");`);
+  let release;
+  h.context.fetch=()=>new Promise(resolve=>{release=resolve;});
+  const pending=h.run('batchCancel()');
+  h.run('updateBatchButton()');
+  assert.equal(h.elements.get('btnBatch').disabled,true);
+  assert.equal(h.elements.get('btnBatchCancel').disabled,true);
+  h.run('ACCOUNT_ID="10002"; ACCOUNT_EPOCH++;');
+  release({json:async()=>({ok:true,results:[{account_id:'10001',tournament_id:'test-event',result:'ok'}]})});
+  await pending;
+  assert.equal(h.elements.get('batchTitle').textContent,'批量取消结果');
+  assert.match(h.elements.get('batchDetails').innerHTML,/UID 10001/);
+  assert.equal(h.run('batchResultOpen'),true);
+  assert.equal(h.run('PICK_TOURS.has("test-event")'),true);
+  h.run('closeBatchResult()');
+  assert.equal(h.elements.get('btnBatch').disabled,false);
+  assert.equal(h.elements.get('btnBatchCancel').disabled,false);
+  assert.equal(h.run('batchRunning'),false);
+  assert.equal(h.run('batchAction'),null);
+});
+
+test('batch cancel handles rejection and network failure cleanly without leaving lock stuck',async()=>{
+  for (const kind of ['rejected','network']) {
+    const h=harness();
+    h.run(`currentPage="events"; ACCOUNT_ID="10001"; PICK_ACCTS.add("10001");
+      PICK_TOURS.add("one"); reloadAll=async()=>{};`);
+    h.context.fetch=kind==='network'
+      ? ()=>Promise.reject(new Error('synthetic-network'))
+      : async()=>({json:async()=>({ok:false,code:'batch_limit_exceeded',error:'一次最多 60 次提交'})});
+    await h.run('batchCancel()');
+    assert.equal(h.run('batchRunning'),false);
+    assert.equal(h.run('batchAction'),null);
+    assert.equal(h.elements.get('batchTitle').textContent,'批量取消结果');
+    assert.equal(h.run('PICK_TOURS.has("one")'),true);
+    assert.match(h.elements.get('batchSummary').textContent,kind==='rejected' ? /失败 1 · 待确认 0/ : /失败 0 · 待确认 1/);
+    h.run('closeBatchResult()');
+    assert.equal(h.elements.get('btnBatch').disabled,false);
+    assert.equal(h.elements.get('btnBatchCancel').disabled,false);
+  }
 });

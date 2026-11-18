@@ -1471,9 +1471,9 @@ def login_capability() -> dict:
 
 
 PROXY_ROUTES = {"/api/state", "/api/tournaments", "/api/my_tournaments", "/api/detail",
-                "/api/enroll", "/api/cancel", "/api/batch_enroll", "/api/records",
-                "/api/records/scan", "/api/records/forget", "/api/account/forget",
-                "/api/account/profile/refresh"}
+                "/api/enroll", "/api/cancel", "/api/batch_enroll", "/api/batch_cancel",
+                "/api/records", "/api/records/scan", "/api/records/forget",
+                "/api/account/forget", "/api/account/profile/refresh"}
 
 
 @remote_operation
@@ -1481,8 +1481,8 @@ def proxy_identity_request():
     ready_login_tunnel()
     body = dict(request.get_json(silent=True) or {})
     params = dict(request.args)
-    no_selector = {"/api/records", "/api/records/scan", "/api/batch_enroll"}
-    if request.path == "/api/batch_enroll":
+    no_selector = {"/api/records", "/api/records/scan", "/api/batch_enroll", "/api/batch_cancel"}
+    if request.path in ("/api/batch_enroll", "/api/batch_cancel"):
         accounts = identity_accounts()
         selectors = body.get("account_ids", body.get("accounts", []))
         if not isinstance(selectors, list):
@@ -1957,6 +1957,39 @@ def api_enroll():
                     "error": "已提交，但复核未确认成功（状态=%r）%s" % (status, last)})
 
 
+def _parse_batch_request(body: dict):
+    """Parse and validate batch account/tournament selections and enforce the 60-item cap."""
+    selectors = body.get("account_ids", body.get("accounts", []))
+    if not isinstance(selectors, list):
+        raise AccountConflict("账号列表必须是数组")
+    accts = list(dict.fromkeys(resolve(STATE["accounts"], value, explicit="account_ids" in body)
+                               for value in selectors))
+    raw_tids = body.get("tournaments") or []
+    if not isinstance(raw_tids, list):
+        raise AccountConflict("赛事列表必须是数组")
+    tids = [str(x) for x in raw_tids if str(x).strip()]
+    if not accts or not tids:
+        return None, None, jsonify({"ok": False, "code": "batch_selection_required",
+                                    "error": "需要同时提供 accounts 与 tournaments"})
+    if len(accts) * len(tids) > 60:
+        # 上限只是防手滑（一次 60 次提交已经很多了），不是技术限制
+        return None, None, jsonify({"ok": False, "code": "batch_limit_exceeded",
+                                    "error": "一次最多 60 次提交（当前 %d 次），请减少账号或赛事"
+                                             % (len(accts) * len(tids))})
+    return accts, tids, None
+
+
+def _batch_response(label: str, results: list[dict]):
+    n_ok = sum(1 for r in results if r["result"] == "ok")
+    n_skip = sum(1 for r in results if r["result"] == "skip")
+    n_fail = sum(1 for r in results if r["result"] == "fail")
+    log("%s结束：成功 %d · 跳过 %d · 失败 %d（共 %d 项）"
+        % (label, n_ok, n_skip, n_fail, len(results)))
+    return jsonify({"ok": True, "results": results,
+                    "summary": {"ok": n_ok, "skip": n_skip, "fail": n_fail,
+                                "total": len(results)}})
+
+
 @app.post("/api/batch_enroll")
 def api_batch_enroll():
     """批量报名：把选中的账号 × 选中的赛事逐个提交。
@@ -1975,21 +2008,9 @@ def api_batch_enroll():
     服务端不在这里做「N×M 确认」——那是界面的职责（已实现二次确认），
     本接口只负责"照单执行 + 如实回报"。
     """
-    body = request.json or {}
-    selectors = body.get("account_ids", body.get("accounts", []))
-    if not isinstance(selectors, list):
-        raise AccountConflict("账号列表必须是数组")
-    accts = list(dict.fromkeys(resolve(STATE["accounts"], value, explicit="account_ids" in body)
-                               for value in selectors))
-    tids = [str(x) for x in (body.get("tournaments") or []) if str(x).strip()]
-    if not accts or not tids:
-        return jsonify({"ok": False, "code": "batch_selection_required",
-                        "error": "需要同时提供 accounts 与 tournaments"})
-    if len(accts) * len(tids) > 60:
-        # 上限只是防手滑（一次 60 次提交已经很多了），不是技术限制
-        return jsonify({"ok": False, "code": "batch_limit_exceeded",
-                        "error": "一次最多 60 次提交（当前 %d 次），请减少账号或赛事"
-                                 % (len(accts) * len(tids))})
+    accts, tids, err = _parse_batch_request(request.json or {})
+    if err is not None:
+        return err
 
     results = []
     for aname in accts:
@@ -2053,14 +2074,84 @@ def api_batch_enroll():
                 add_record(aname, acc.uid, tid, nm, source="批量报名", status=it2.get("zh_user_status"))
             log("批量报名：%s → %s（%s）" % (aname, nm, "成功" if ok2 else "复核未通过"))
 
-    n_ok = sum(1 for r in results if r["result"] == "ok")
-    n_skip = sum(1 for r in results if r["result"] == "skip")
-    n_fail = sum(1 for r in results if r["result"] == "fail")
-    log("批量报名结束：成功 %d · 跳过 %d · 失败 %d（共 %d 项）"
-        % (n_ok, n_skip, n_fail, len(results)))
-    return jsonify({"ok": True, "results": results,
-                    "summary": {"ok": n_ok, "skip": n_skip, "fail": n_fail,
-                                "total": len(results)}})
+    return _batch_response("批量报名", results)
+
+
+@app.post("/api/batch_cancel")
+def api_batch_cancel():
+    """批量取消报名 / 取消预约：仅对「已报名」「已预约」执行取消并做快速复核。"""
+    accts, tids, err = _parse_batch_request(request.json or {})
+    if err is not None:
+        return err
+
+    results = []
+    for aid in accts:
+        acc = STATE["accounts"].get(aid)
+        if not acc:
+            for tid in tids:
+                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                "result": "fail", "reason": "账号不存在"})
+            continue
+        c = SveClient(acc)
+        for tid in tids:
+            try:
+                it = c.detail(tid)
+            except SveError as e:
+                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                "result": "fail", "reason": str(e)})
+                continue
+            own = it.get("zh_user_status")
+            nm = it.get("name") or tid
+            # 规则 A：仅官方状态为「已报名」「已预约」才执行取消；其余状态一律 skip。
+            if own not in ("已报名", "已预约"):
+                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                "name": nm, "result": "skip",
+                                "reason": "未报名或不可取消（%s）" % (own or "未知状态")})
+                continue
+            try:
+                c.cancel(tid)
+            except SveError as e:
+                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                "name": nm, "result": "fail", "reason": str(e)})
+                continue
+            ok2, why, after = False, "", None
+            try:
+                it2 = c.detail(tid)
+                after = it2.get("zh_user_status")
+                if after in ("已报名", "已预约"):
+                    time.sleep(0.5)
+                    it2 = c.detail(tid)
+                    after = it2.get("zh_user_status")
+                ok2 = after not in ("已报名", "已预约")
+                if not ok2:
+                    why = "提交后复核状态仍为 %r" % after
+            except SveError as e:
+                why = "提交后复核失败：%s" % e
+            results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                            "name": nm, "result": "ok" if ok2 else "fail",
+                            "reason": "" if ok2 else why})
+            if ok2:
+                # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
+                key = sub_key(aid, tid)
+                sched, sub = None, None
+                with LOCK:
+                    if key in STATE["schedulers"] or key in STATE["subs"]:
+                        sched = STATE["schedulers"].pop(key, None)
+                        sub = STATE["subs"].pop(key, None)
+                        persist_subs()
+                    rec = STATE["records"].get(key)
+                    if rec is not None:
+                        rec["status"] = after or "已取消"
+                        rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        rec["checked_at"] = time.time()
+                        persist_records()
+                if sched:
+                    sched.stop()
+                if sub or sched:
+                    log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
+            log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
+
+    return _batch_response("批量取消", results)
 
 
 @app.post("/api/cancel")
