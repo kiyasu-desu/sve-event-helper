@@ -1876,3 +1876,44 @@ test('batch cancel handles rejection and network failure cleanly without leaving
     assert.equal(h.elements.get('btnBatchCancel').disabled,false);
   }
 });
+
+test('multi-account batch actions keep picks on partial failure/pending and clear cached subscriptions on cancel ok',async()=>{
+  const h=harness();
+  h.run(`currentPage="events"; ACCOUNT_ID="10001";
+    ACCOUNT_ROWS=new Map([
+      ["10001",{nickname:"test-a1",account_id:"10001",version:1}],
+      ["10002",{nickname:"test-a2",account_id:"10002",version:1}]
+    ]);
+    TOURS=[
+      {tournament_id:"t-mixed",name:"test-mixed"},
+      {tournament_id:"t-settled",name:"test-settled"},
+      {tournament_id:"t-pending",name:"test-pending"}
+    ];
+    PICK_ACCTS.add("10001"); PICK_ACCTS.add("10002");
+    PICK_TOURS.add("t-mixed"); PICK_TOURS.add("t-settled"); PICK_TOURS.add("t-pending");
+    subscriptionView.update({ok:true,sub_count:1,subs_grouped:{"10002":[{key:"10002|t-settled",account_id:"10002",tournament_id:"t-settled",name:"test-settled"}]}});
+    reloadAll=async()=>{throw new Error('synthetic-reload-fail');};`);
+  const mixedPick={checked:true,dataset:{id:'t-mixed'}};
+  const settledPick={checked:true,dataset:{id:'t-settled'}};
+  const pendingPick={checked:true,dataset:{id:'t-pending'}};
+  h.context.document.querySelectorAll=selector=>selector.endsWith(':checked')?[mixedPick,settledPick,pendingPick]:[];
+  h.context.fetch=async()=>({json:async()=>({ok:true,results:[
+    {account_id:'10001',tournament_id:'t-mixed',result:'ok'},
+    {account_id:'10002',tournament_id:'t-mixed',result:'fail',reason:'test-err'},
+    {account_id:'10001',tournament_id:'t-settled',result:'skip'},
+    {account_id:'10002',tournament_id:'t-settled',result:'ok'},
+    {account_id:'10001',tournament_id:'t-pending',result:'ok'}
+  ]})});
+
+  await h.run('batchCancel()');
+  assert.deepEqual(Array.from(h.run('PICK_TOURS')),['t-mixed','t-pending']);
+  assert.equal(mixedPick.checked,true);
+  assert.equal(settledPick.checked,false);
+  assert.equal(pendingPick.checked,true);
+  assert.equal(h.elements.get('btnBatch').hidden,true);
+  assert.equal(h.elements.get('btnBatchCancel').hidden,true);
+
+  h.run('closeBatchResult(); currentPage="subs"; subscriptionView.render();');
+  assert.doesNotMatch(h.elements.get('groups').innerHTML,/t-settled/);
+  assert.match(h.elements.get('summary').textContent,/共 0 条订阅/);
+});

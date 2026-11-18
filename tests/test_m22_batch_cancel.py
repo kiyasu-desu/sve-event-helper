@@ -183,6 +183,9 @@ class BatchCancelTests(unittest.TestCase):
                 for bad_body in (
                     {"account_ids": "10001", "tournaments": ["test-e1"]},
                     {"account_ids": ["10001"], "tournaments": "test-e1"},
+                    {"account_ids": ["10001"], "tournaments": ""},
+                    {"account_ids": ["10001"], "tournaments": 0},
+                    {"account_ids": ["10001"], "tournaments": False},
                     {"account_ids": ["10001", "999"], "tournaments": ["test-e1"]},
                 ):
                     bad = self.post(path, bad_body)
@@ -190,6 +193,23 @@ class BatchCancelTests(unittest.TestCase):
                     self.assertEqual("identity_conflict", bad["code"])
             client.assert_not_called()
         self.assertEqual(before, self.snapshot())
+
+    def test_duplicate_and_none_tournaments_are_deduplicated(self):
+        srv = self.srv
+        calls = []
+        def detail(client, tid):
+            calls.append(tid)
+            return {"name": "test-dup", "zh_user_status": "已报名" if len(calls) == 1 else "可报名"}
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True) as cancel:
+            res = self.post("/api/batch_cancel", {
+                "account_ids": ["10001"],
+                "tournaments": ["test-dup", None, " ", "test-dup"],
+            })
+        self.assertTrue(res["ok"])
+        self.assertEqual(1, len(res["results"]))
+        self.assertEqual({"ok": 1, "skip": 0, "fail": 0, "total": 1}, res["summary"])
+        cancel.assert_called_once()
 
     def test_rule_a_only_cancels_registered_and_booked_and_skips_all_others(self):
         srv = self.srv

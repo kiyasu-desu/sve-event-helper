@@ -300,7 +300,7 @@ button.small.act { min-width: 84px; text-align: center; }
     <button id="btnLogin" class="primary" style="width:100%">新增账号</button>
     <div id="loginBox" style="margin-top:8px"></div>
     <div class="toolbar" style="margin-top:6px">
-      <span class="muted">勾选账号可参与「一键报名」</span>
+      <span class="muted">勾选账号可参与批量操作</span>
     </div>
     <div id="connectionStatus" class="banner err" role="status" style="display:none"></div>
     <div id="acctList" class="scroll" role="region" aria-labelledby="accountsHeading" tabindex="0"></div>
@@ -514,7 +514,7 @@ function renderAccountList() {
     <div class="card">
       <div class="acct-info">
         <input type="checkbox" class="pick" data-kind="acct" data-id="${esc(a.account_id)}"
-               aria-label="勾选 ${esc(accountLabel(a.account_id))} 参与一键报名">
+               aria-label="勾选 ${esc(accountLabel(a.account_id))} 参与批量操作">
         <div>
           <div class="title">${esc(a.nickname || a.name)} ${a.active ? '<span class="tag g-mine">当前</span>' : ''}</div>
           <div class="muted">UID ${esc(a.account_id)} · ${esc(a.mobile || '')}</div>
@@ -939,7 +939,7 @@ function cardMine(t) {
   return `
     <div class="card">
       <div class="row" style="align-items:flex-start">
-        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与一键报名">
+        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与批量操作">
         <div style="flex:1;min-width:0">
           <div class="title">${esc(t.name)}
             <span class="tag g-${t.group}">${esc(t.status)}</span>
@@ -976,7 +976,7 @@ function cardOpen(t) {
   return `
     <div class="card">
       <div class="row" style="align-items:flex-start">
-        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与一键报名">
+        <input type="checkbox" class="pick" data-kind="tour" data-id="${esc(t.tournament_id)}" ${picked ? "checked" : ""} title="勾选以参与批量操作">
         <div style="flex:1;min-width:0">
           <div class="title">${esc(t.name)}
             <span class="tag g-${t.group}">${esc(t.status)}</span>
@@ -1725,14 +1725,16 @@ async function runBatchAction(mode) {
     });
     showBatchResult(rows, batchAction);
 
-    // Uncheck successful events before releasing the submit lock or reloading the list.
+    // Uncheck events only when every selected account is settled (no fail/pending).
     if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) {
       const prefix = isCancel ? "批量取消结果" : "批量报名结果";
       setStatus(`${prefix}：${$("batchSummary").textContent}`,
         rows.some(row => row.result === "fail" || row.result === "pending") ? "err" : "ok");
+      const settledTours = new Set(rows.filter(row => row.result === "ok").map(row => row.tournament_id));
       for (const row of rows) {
+        if (row.result === "fail" || row.result === "pending") settledTours.delete(row.tournament_id);
         if (row.result === "ok") {
-          PICK_TOURS.delete(row.tournament_id);
+          if (isCancel) removeConfirmedSubscription(row.account_id, row.tournament_id);
           if (row.account_id === accountId) {
             confirmEnroll(row.tournament_id, !isCancel);
             if (isCancel && (MINE.has(row.tournament_id) || CONFIRMED.has(row.tournament_id))) {
@@ -1741,6 +1743,7 @@ async function runBatchAction(mode) {
           }
         }
       }
+      for (const tid of settledTours) PICK_TOURS.delete(tid);
       document.querySelectorAll('input.pick[data-kind="tour"]:checked').forEach(input => {
         input.checked = PICK_TOURS.has(input.dataset.id);
       });
@@ -1751,7 +1754,9 @@ async function runBatchAction(mode) {
     batchAction = null;
     updateBatchButton();
   }
-  if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) await reloadAll();
+  if (accountId === ACCOUNT_ID && epoch === ACCOUNT_EPOCH) {
+    try { await reloadAll(); } catch (e) { }
+  }
 }
 
 function batchEnroll() { return runBatchAction("enroll"); }

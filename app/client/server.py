@@ -1964,10 +1964,10 @@ def _parse_batch_request(body: dict):
         raise AccountConflict("账号列表必须是数组")
     accts = list(dict.fromkeys(resolve(STATE["accounts"], value, explicit="account_ids" in body)
                                for value in selectors))
-    raw_tids = body.get("tournaments") or []
+    raw_tids = [] if body.get("tournaments") is None else body.get("tournaments")
     if not isinstance(raw_tids, list):
         raise AccountConflict("赛事列表必须是数组")
-    tids = [str(x) for x in raw_tids if str(x).strip()]
+    tids = list(dict.fromkeys(str(x) for x in raw_tids if x is not None and str(x).strip()))
     if not accts or not tids:
         return None, None, jsonify({"ok": False, "code": "batch_selection_required",
                                     "error": "需要同时提供 accounts 与 tournaments"})
@@ -2135,16 +2135,19 @@ def api_batch_cancel():
                 key = sub_key(aid, tid)
                 sched, sub = None, None
                 with LOCK:
+                    dirty = False
                     if key in STATE["schedulers"] or key in STATE["subs"]:
                         sched = STATE["schedulers"].pop(key, None)
                         sub = STATE["subs"].pop(key, None)
-                        persist_subs()
+                        dirty = True
                     rec = STATE["records"].get(key)
                     if rec is not None:
                         rec["status"] = after or "已取消"
                         rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
                         rec["checked_at"] = time.time()
-                        persist_records()
+                        dirty = True
+                    if dirty:
+                        persist_dataset()
                 if sched:
                     sched.stop()
                 if sub or sched:
