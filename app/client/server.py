@@ -103,7 +103,7 @@ def _no_cache(resp):
 STATE = {
     "active": None,          # default account_id; browser choice is a per-client cookie
     "accounts": {},          # account_id -> Account
-    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "record_epochs": {}, "login_intents": {}, "storage_failed": False,
+    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "cancel_epochs": {}, "record_epochs": {}, "login_intents": {}, "storage_failed": False,
     # 订阅以 "(account_id, 赛事id)" 为键，不依赖可变昵称。
     # 早先用赛事id 作键，导致换账号后订阅被"改绑"，这是错误的。
     "subs": {},              # sub_key -> {account, uid, tournament_id, ..., logs: []}
@@ -2107,12 +2107,24 @@ def api_batch_enroll():
     return _batch_response("批量报名", results)
 
 
+def _check_cancel_subscribe_conflict_locked(key: str, expected_epoch=None):
+    if key in STATE.get("batch_cancel_keys", {}):
+        return jsonify({"ok": False, "code": "subscription_conflict",
+                        "error": "该赛事正在执行批量取消，请稍后重试"})
+    if expected_epoch is not None and STATE.get("cancel_epochs", {}).get(key, 0) != expected_epoch:
+        return jsonify({"ok": False, "code": "subscription_conflict",
+                        "error": "该赛事与批量取消操作重叠，订阅已失效，请稍后重试"})
+    return None
+
+
 @contextlib.contextmanager
 def _quiesce_subscription(key: str):
     """Coordinate with any active/exiting scheduler action for `key` during cancellation."""
     with LOCK:
         holds = STATE.setdefault("batch_cancel_keys", {})
         holds[key] = holds.get(key, 0) + 1
+        cancel_epochs = STATE.setdefault("cancel_epochs", {})
+        cancel_epochs[key] = cancel_epochs.get(key, 0) + 1
         candidates = []
         for candidate in (STATE["schedulers"].get(key),
                           getattr(STATE["workers"].get(key), "_scheduler", None)):
@@ -2594,9 +2606,17 @@ def api_subscribe():
         # 有这个参数才能在"不想改动全局激活账号"时把赛事订阅给特定账号
         # （例如大奖赛固定用某个账号盯）。
         aid = request_account(body)
-        c = SveClient(STATE["accounts"][aid])
         with LOCK:
-            check_subscription_identity(body, c.account.account_id)
+            acc = STATE["accounts"].get(aid)
+            if not acc:
+                raise AccountConflict("订阅身份对象已删除或重建")
+            check_subscription_identity(body, acc.account_id)
+            key = sub_key(acc.account_id, tid)
+            conflict = _check_cancel_subscribe_conflict_locked(key)
+            if conflict is not None:
+                return conflict
+            cancel_epoch = STATE.get("cancel_epochs", {}).get(key, 0)
+        c = SveClient(acc)
         it = c.detail(tid)
     except AccountConflict as e:
         return jsonify({"ok": False, "code": "subscription_conflict", "error": str(e)})
@@ -2619,15 +2639,15 @@ def api_subscribe():
                 raise AccountConflict("订阅身份对象已删除或重建")
         except AccountConflict as e:
             return jsonify({"ok": False, "code": "subscription_conflict", "error": str(e)})
+        conflict = _check_cancel_subscribe_conflict_locked(key, cancel_epoch)
+        if conflict is not None:
+            return conflict
         sched = STATE["schedulers"].get(key)
         if sched is not None and sched.stop_flag.is_set() and not sched.completed:
             return jsonify({"ok": False, "code": "subscription_conflict",
                             "error": "旧订阅线程尚未退出，请稍后重试"})
         if key in STATE["workers"] and key not in STATE["schedulers"]:
             raise AccountConflict("旧订阅线程尚未退出，暂不重建执行点")
-        if key in STATE.get("batch_cancel_keys", {}):
-            return jsonify({"ok": False, "code": "subscription_conflict",
-                            "error": "该赛事正在执行批量取消，请稍后重试"})
         old = STATE["subs"].get(key) or {}
         STATE["subs"][key] = {
             "account_id": acc.account_id, "account": acc.account_id, "uid": acc.uid, "tournament_id": tid,

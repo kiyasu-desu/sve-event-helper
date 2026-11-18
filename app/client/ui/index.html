@@ -1730,7 +1730,7 @@ async function runBatchAction(mode) {
       const prefix = isCancel ? "批量取消结果" : "批量报名结果";
       setStatus(`${prefix}：${$("batchSummary").textContent}`,
         rows.some(row => row.result === "fail" || row.result === "pending") ? "err" : "ok");
-      const settledTours = new Set(rows.filter(row => row.result === "ok").map(row => row.tournament_id));
+      const settledTours = new Set(tours);
       for (const row of rows) {
         if (row.result === "fail" || row.result === "pending") settledTours.delete(row.tournament_id);
         if (row.result === "ok") {

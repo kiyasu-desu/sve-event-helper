@@ -111,6 +111,7 @@ class BatchCancelTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            cancel_epochs={},
             record_epochs={},
             pending=[],
             tombstones={},
@@ -546,6 +547,7 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            cancel_epochs={},
             record_epochs={},
             pending=[],
             tombstones={},
@@ -1004,6 +1006,121 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         self.assertEqual("已报名", srv.STATE["records"][k2]["status"])
         self.assertGreater(srv.STATE["records"][k2]["checked_at"], 0.0)
         self.assertEqual(4, srv.STATE["records"][k2]["player_num"])
+
+    def test_overlapping_subscribe_during_cancel_rejected_even_after_cancel_finishes(self):
+        srv = self.srv
+        key, tid = "10001|test-overlap-sub", "test-overlap-sub"
+        sched, sched_thread = self._setup_scheduler(key, tid)
+        sched.stop_flag.clear()
+
+        state_lock = threading.Lock()
+        server_state = {"status": "已报名"}
+        sub_detail_entered = threading.Event()
+        release_sub_detail = threading.Event()
+        signup_calls = []
+        self.addCleanup(release_sub_detail.set)
+
+        def detail(client, qtid):
+            if client is sched.client:
+                return {"name": qtid, "zh_user_status": "未报名", "player_num": 1, "max_player_number": 8}
+            name = threading.current_thread().name
+            with state_lock:
+                snapshot = {"name": qtid, "zh_user_status": server_state["status"],
+                            "player_num": 1, "max_player_number": 8}
+            if name.startswith("sub-overlap"):
+                sub_detail_entered.set()
+                release_sub_detail.wait(timeout=5)
+            return snapshot
+
+        def cancel(client, qtid):
+            with state_lock:
+                server_state["status"] = "可报名"
+
+        def signup(client, qtid):
+            signup_calls.append(qtid)
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel), \
+                patch.object(srv.SveClient, "signup", autospec=True, side_effect=signup):
+            sched_thread.start()
+            sub_result = {}
+
+            def run_subscribe():
+                sub_result["res"] = self._post("/api/subscribe", {"account_id": "10001", "tournament_id": tid})
+
+            sub_thread = threading.Thread(target=run_subscribe, daemon=True, name="sub-overlap")
+            sub_thread.start()
+            self.assertTrue(sub_detail_entered.wait(timeout=5))
+
+            cancel_res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            self.assertEqual("ok", cancel_res["results"][0]["result"])
+            sched_thread.join(timeout=5)
+            self.assertNotIn(key, srv.STATE["batch_cancel_keys"])
+            self.assertNotIn(key, srv.STATE["subs"])
+            self.assertNotIn(key, srv.STATE["schedulers"])
+            self.assertNotIn(key, srv.STATE["workers"])
+
+            release_sub_detail.set()
+            sub_thread.join(timeout=5)
+
+            self.assertFalse(sub_result["res"]["ok"])
+            self.assertEqual("subscription_conflict", sub_result["res"]["code"])
+            self.assertNotIn(key, srv.STATE["subs"])
+            self.assertNotIn(key, srv.STATE["schedulers"])
+            self.assertEqual([], signup_calls)
+
+            # A subsequent fresh subscribe initiated after cancellation completes works normally.
+            fresh_res = self._post("/api/subscribe", {"account_id": "10001", "tournament_id": tid})
+            self.assertTrue(fresh_res["ok"])
+            self.assertIn(key, srv.STATE["subs"])
+            new_sched = srv.STATE["schedulers"].get(key)
+            new_worker = srv.STATE["workers"].get(key)
+            if new_sched is not None:
+                new_sched.stop()
+            if new_worker is not None and new_worker.ident is not None:
+                new_worker.join(timeout=3)
+
+    def test_subscribe_while_batch_cancel_active_rejects_without_upstream_detail(self):
+        srv = self.srv
+        tid = "test-active-cancel-sub"
+        cancel_entered = threading.Event()
+        release_cancel = threading.Event()
+        server_state = {"status": "已报名"}
+        detail_threads = []
+        self.addCleanup(release_cancel.set)
+
+        def detail(client, qtid):
+            detail_threads.append(threading.current_thread().name)
+            return {"name": qtid, "zh_user_status": server_state["status"], "player_num": 1, "max_player_number": 8}
+
+        def cancel(client, qtid):
+            cancel_entered.set()
+            release_cancel.wait(timeout=5)
+            server_state["status"] = "可报名"
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            batch_box = {}
+            batch_thread = threading.Thread(
+                target=lambda: batch_box.__setitem__("res", self._post(
+                    "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                )),
+                daemon=True,
+                name="batch-cancel-worker",
+            )
+            batch_thread.start()
+            self.assertTrue(cancel_entered.wait(timeout=5))
+
+            calls_before = len(detail_threads)
+            sub_res = self._post("/api/subscribe", {"account_id": "10001", "tournament_id": tid})
+            self.assertFalse(sub_res["ok"])
+            self.assertEqual("subscription_conflict", sub_res["code"])
+            self.assertEqual(calls_before, len(detail_threads))
+
+            release_cancel.set()
+            batch_thread.join(timeout=5)
+
+        self.assertEqual("ok", batch_box["res"]["results"][0]["result"])
 
 
 if __name__ == "__main__":

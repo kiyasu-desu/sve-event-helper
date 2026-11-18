@@ -1767,7 +1767,7 @@ test('batch enroll and batch cancel mutually disable both buttons and preserve i
   }
 });
 
-test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, and clears only ok picks',async()=>{
+test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, and clears settled picks',async()=>{
   const h=harness();
   h.run(`currentPage="events"; ACCOUNT_ID="10001";
     ACCOUNT_ROWS=new Map([["10001",{nickname:"test-account",account_id:"10001",version:1}]]);
@@ -1818,9 +1818,9 @@ test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, 
   assert.match(detail,/test-fail-name：失败：test-cancel-failed<\/p>/);
 
   assert.equal(okPick.checked,false);
-  assert.equal(skipPick.checked,true);
+  assert.equal(skipPick.checked,false);
   assert.equal(failPick.checked,true);
-  assert.deepEqual(Array.from(h.run('PICK_TOURS')),['test-skip','test-fail']);
+  assert.deepEqual(Array.from(h.run('PICK_TOURS')),['test-fail']);
   assert.equal(h.run('ENROLLED.get("test-ok")?.want'),false);
 
   h.run('closeBatchResult()');
@@ -1916,4 +1916,49 @@ test('multi-account batch actions keep picks on partial failure/pending and clea
   h.run('closeBatchResult(); currentPage="subs"; subscriptionView.render();');
   assert.doesNotMatch(h.elements.get('groups').innerHTML,/t-settled/);
   assert.match(h.elements.get('summary').textContent,/共 0 条订阅/);
+});
+
+test('all-skip batch results clear settled tournament picks for cancel and enroll while partial skip+fail/pending keep picks',async()=>{
+  for (const mode of ['cancel', 'enroll']) {
+    const h=harness();
+    h.run(`currentPage="events"; ACCOUNT_ID="10001";
+      ACCOUNT_ROWS=new Map([
+        ["10001",{nickname:"test-a1",account_id:"10001",version:1}],
+        ["10002",{nickname:"test-a2",account_id:"10002",version:1}]
+      ]);
+      TOURS=[
+        {tournament_id:"t-all-skip",name:"test-all-skip"},
+        {tournament_id:"t-unsettled",name:"test-unsettled"}
+      ];
+      PICK_ACCTS.add("10001"); PICK_ACCTS.add("10002");
+      PICK_TOURS.add("t-all-skip"); PICK_TOURS.add("t-unsettled");
+      if ("${mode}" === "cancel") confirmEnroll("t-all-skip", true);
+      reloadAll=async()=>{};`);
+    const allSkipPick={checked:true,dataset:{id:'t-all-skip'}};
+    const unsettledPick={checked:true,dataset:{id:'t-unsettled'}};
+    h.context.document.querySelectorAll=selector=>selector.endsWith(':checked')?[allSkipPick,unsettledPick]:[];
+    h.context.fetch=async()=>({json:async()=>({ok:true,results:mode==='cancel'
+      ? [
+          {account_id:'10001',tournament_id:'t-all-skip',result:'skip'},
+          {account_id:'10002',tournament_id:'t-all-skip',result:'skip'},
+          {account_id:'10001',tournament_id:'t-unsettled',result:'skip'},
+          {account_id:'10002',tournament_id:'t-unsettled',result:'fail',reason:'test-err'}
+        ]
+      : [
+          {account_id:'10001',tournament_id:'t-all-skip',result:'skip'},
+          {account_id:'10002',tournament_id:'t-all-skip',result:'skip'},
+          {account_id:'10001',tournament_id:'t-unsettled',result:'skip'}
+        ]
+    })});
+
+    await h.run(mode==='cancel'?'batchCancel()':'batchEnroll()');
+    assert.deepEqual(Array.from(h.run('PICK_TOURS')),['t-unsettled']);
+    assert.equal(allSkipPick.checked,false);
+    assert.equal(unsettledPick.checked,true);
+    if (mode==='cancel') {
+      // Skipping must not overwrite local enroll status cache.
+      assert.equal(h.run('ENROLLED.get("t-all-skip")?.want'),true);
+    }
+    h.run('closeBatchResult()');
+  }
 });
