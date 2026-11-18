@@ -103,7 +103,7 @@ def _no_cache(resp):
 STATE = {
     "active": None,          # default account_id; browser choice is a per-client cookie
     "accounts": {},          # account_id -> Account
-    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "login_intents": {}, "storage_failed": False,
+    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "record_epochs": {}, "login_intents": {}, "storage_failed": False,
     # 订阅以 "(account_id, 赛事id)" 为键，不依赖可变昵称。
     # 早先用赛事id 作键，导致换账号后订阅被"改绑"，这是错误的。
     "subs": {},              # sub_key -> {account, uid, tournament_id, ..., logs: []}
@@ -1279,12 +1279,32 @@ def notify_account_purged(account: str, dropped: list, *, reason: str = "") -> N
     send_notify("【SVE】账号已移除，%d 条订阅已清理 - %s" % (len(dropped), account), html)
 
 
+def _record_epoch_locked(key: str) -> int:
+    return STATE.get("record_epochs", {}).get(key, 0)
+
+
+def _bump_record_epoch_locked(key: str) -> int:
+    epochs = STATE.setdefault("record_epochs", {})
+    epochs[key] = epochs.get(key, 0) + 1
+    return epochs[key]
+
+
+def _record_refresh_valid_locked(key: str, epoch: int) -> bool:
+    """Return True iff `key` still exists, matches `epoch`, and is not cancelling."""
+    return (
+        key in STATE["records"]
+        and _record_epoch_locked(key) == epoch
+        and key not in STATE.get("batch_cancel_keys", {})
+    )
+
+
 def add_record(account: str, uid, tid, name: str, source: str,
                status: str = "已报名") -> None:
     """记一笔"已报名"。同一 (账号, 赛事) 只保留最新一条。"""
     key = sub_key(account, tid)
     with LOCK:
         old = STATE["records"].get(key) or {}
+        _bump_record_epoch_locked(key)
         STATE["records"][key] = {
             "account_id": account, "account": account, "uid": uid, "tournament_id": str(tid),
             "name": name, "source": source, "status": status,
@@ -1304,8 +1324,11 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
     with LOCK:
         if RECORDS_REFRESHING["flag"]:
             return
-        stale = [(k, dict(v)) for k, v in STATE["records"].items()
-                 if (account_id is None or v["account_id"] == account_id)
+        epochs = STATE.setdefault("record_epochs", {})
+        cancelling = STATE.get("batch_cancel_keys", {})
+        stale = [(k, dict(v), epochs.get(k, 0)) for k, v in STATE["records"].items()
+                 if k not in cancelling
+                 and (account_id is None or v["account_id"] == account_id)
                  and v["account_id"] in STATE["accounts"]
                  and time.time() - float(v.get("checked_at") or 0) > max_age]
         RECORDS_REFRESHING["flag"] = True
@@ -1316,19 +1339,22 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
 
     def worker():
         try:
-            for key, rec in stale:
-                acc = STATE["accounts"].get(rec.get("account_id"))
+            for key, rec, epoch in stale:
+                with LOCK:
+                    if not _record_refresh_valid_locked(key, epoch):
+                        continue
+                    acc = STATE["accounts"].get(rec.get("account_id"))
                 if not acc:
                     with LOCK:
-                        if key in STATE["records"]:
+                        if _record_refresh_valid_locked(key, epoch):
                             STATE["records"][key]["status"] = "账号已删除"
                             STATE["records"][key]["checked_at"] = time.time()
                     continue
                 try:
                     it = SveClient(acc).detail(rec["tournament_id"])
                     with LOCK:
-                        r = STATE["records"].get(key)
-                        if r:
+                        if _record_refresh_valid_locked(key, epoch):
+                            r = STATE["records"][key]
                             r["status"] = it.get("zh_user_status") or r.get("status")
                             r["player_num"] = it.get("player_num")
                             r["max"] = it.get("max_player_number")
@@ -1337,7 +1363,7 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
                             r["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     with LOCK:
-                        if key in STATE["records"]:
+                        if _record_refresh_valid_locked(key, epoch):
                             STATE["records"][key]["checked_at"] = time.time()
                 time.sleep(0.3)
             with LOCK:
@@ -2183,6 +2209,7 @@ def api_batch_cancel():
                             if candidate is not None and all(candidate is not existing for existing in stopped):
                                 stopped.append(candidate)
                         rec = STATE["records"].get(key)
+                        _bump_record_epoch_locked(key)
                         if rec is not None:
                             rec["status"] = after or "已取消"
                             rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2333,6 +2360,7 @@ def api_records_forget():
     else:
         key = sub_key(request_account(body), str(body.get("tournament_id") or ""))
     with LOCK:
+        _bump_record_epoch_locked(key)
         STATE["records"].pop(key, None)
         persist_records()
     return jsonify({"ok": True})

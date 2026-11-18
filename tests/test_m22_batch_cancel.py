@@ -5,6 +5,7 @@ from contextlib import ExitStack
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import socket
@@ -110,6 +111,7 @@ class BatchCancelTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            record_epochs={},
             pending=[],
             tombstones={},
             operations={},
@@ -120,6 +122,13 @@ class BatchCancelTests(unittest.TestCase):
         store = srv.IdentityStore(self.data)
         store.load(initialize=True)
         self.patches.enter_context(patch.object(srv, "STORE", store))
+        self.patches.enter_context(patch.dict(srv.RECORDS_REFRESHING, {"flag": False}))
+
+        def _cleanup_refresh():
+            with srv.LOCK:
+                srv.RECORDS_REFRESHING["flag"] = False
+
+        self.addCleanup(_cleanup_refresh)
         srv.persist_accounts()
         srv.persist_subs()
         srv.persist_records()
@@ -537,6 +546,7 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             scheduler_threads=set(),
             workers={},
             batch_cancel_keys={},
+            record_epochs={},
             pending=[],
             tombstones={},
             operations={},
@@ -547,9 +557,23 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         store = srv.IdentityStore(self.data)
         store.load(initialize=True)
         self.patches.enter_context(patch.object(srv, "STORE", store))
+        self.patches.enter_context(patch.dict(srv.RECORDS_REFRESHING, {"flag": False}))
+
+        def _cleanup_refresh():
+            with srv.LOCK:
+                srv.RECORDS_REFRESHING["flag"] = False
+
+        self.addCleanup(_cleanup_refresh)
         srv.persist_accounts()
         srv.persist_subs()
         srv.persist_records()
+
+    def _get(self, path: str):
+        with self.srv.app.test_client() as client:
+            client.set_cookie("sve_account_id", "10001")
+            response = client.get(path)
+            self.assertEqual(200, response.status_code)
+            return response.get_json()
 
     def _post(self, path: str, body: dict):
         with self.srv.app.test_client() as client:
@@ -860,6 +884,126 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         self.assertFalse(sched.completed)
         self.assertTrue(sched.stop_flag.is_set())
         self.assertNotIn(key, srv.STATE["subs"])
+
+    def _wait_for_refresh_idle(self, timeout: float = 5.0):
+        srv = self.srv
+        wait_evt = threading.Event()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with srv.LOCK:
+                if not srv.RECORDS_REFRESHING["flag"]:
+                    return
+            wait_evt.wait(0.01)
+        self.fail("Timed out waiting for refresh_records worker to finish")
+
+    def test_stale_refresh_worker_cannot_overwrite_cancelled_record_status(self):
+        srv = self.srv
+        key, tid = "10001|test-stale-rec", "test-stale-rec"
+        srv.STATE["records"][key] = {
+            "account_id": "10001", "account": "10001", "uid": 10001,
+            "tournament_id": tid, "name": tid, "source": "测试",
+            "status": "已报名", "at": "2026-01-01 00:00:00",
+            "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
+        }
+        srv.persist_records()
+
+        state_lock = threading.Lock()
+        server_state = {"status": "已报名"}
+        detail_threads = []
+        refresh_fetched = threading.Event()
+        release_refresh_write = threading.Event()
+        self.addCleanup(release_refresh_write.set)
+
+        def detail(client, qtid):
+            name = threading.current_thread().name
+            detail_threads.append(name)
+            with state_lock:
+                snapshot = {"name": qtid, "zh_user_status": server_state["status"],
+                            "player_num": 5, "max_player_number": 8}
+            if name == "rec-refresh":
+                refresh_fetched.set()
+                release_refresh_write.wait(timeout=5)
+            return snapshot
+
+        def cancel(client, qtid):
+            with state_lock:
+                server_state["status"] = "可报名"
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            initial = self._get("/api/records")
+            self.assertEqual("已报名", initial["records"][0]["status"])
+            self.assertTrue(refresh_fetched.wait(timeout=5))
+
+            res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            self.assertEqual("ok", res["results"][0]["result"])
+            cancel_checked_at = srv.STATE["records"][key]["checked_at"]
+            self.assertGreater(cancel_checked_at, 0.0)
+            self.assertEqual("可报名", srv.STATE["records"][key]["status"])
+
+            release_refresh_write.set()
+            self._wait_for_refresh_idle()
+
+            self.assertEqual("可报名", srv.STATE["records"][key]["status"])
+            self.assertEqual(cancel_checked_at, srv.STATE["records"][key]["checked_at"])
+            on_disk = json.loads(srv.STORE.path.read_text(encoding="utf-8"))["records"]
+            self.assertEqual("可报名", on_disk[key]["status"])
+            self.assertEqual(cancel_checked_at, on_disk[key]["checked_at"])
+
+            calls_before = len(detail_threads)
+            after = self._get("/api/records")
+            self.assertEqual("可报名", after["records"][0]["status"])
+            self.assertEqual(calls_before, len(detail_threads))
+
+    def test_stale_refresh_worker_skips_cancelled_key_and_refreshes_other_keys(self):
+        srv = self.srv
+        k1, t1 = "10001|test-rec-1", "test-rec-1"
+        k2, t2 = "10001|test-rec-2", "test-rec-2"
+        for k, tid in ((k1, t1), (k2, t2)):
+            srv.STATE["records"][k] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": tid, "name": tid, "source": "测试",
+                "status": "已报名", "at": "2026-01-01 00:00:00",
+                "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
+            }
+        srv.persist_records()
+
+        state_lock = threading.Lock()
+        server_state = {t1: "已报名", t2: "已报名"}
+        t1_refresh_fetched = threading.Event()
+        release_refresh = threading.Event()
+        self.addCleanup(release_refresh.set)
+
+        def detail(client, qtid):
+            with state_lock:
+                snapshot = {"name": qtid, "zh_user_status": server_state[qtid],
+                            "player_num": 4, "max_player_number": 8}
+            if threading.current_thread().name == "rec-refresh" and qtid == t1:
+                t1_refresh_fetched.set()
+                release_refresh.wait(timeout=5)
+            return snapshot
+
+        def cancel(client, qtid):
+            with state_lock:
+                server_state[qtid] = "可报名"
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            self._get("/api/records")
+            self.assertTrue(t1_refresh_fetched.wait(timeout=5))
+
+            res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [t1]})
+            self.assertEqual("ok", res["results"][0]["result"])
+            cancel_checked_at = srv.STATE["records"][k1]["checked_at"]
+
+            release_refresh.set()
+            self._wait_for_refresh_idle()
+
+        self.assertEqual("可报名", srv.STATE["records"][k1]["status"])
+        self.assertEqual(cancel_checked_at, srv.STATE["records"][k1]["checked_at"])
+        self.assertEqual("已报名", srv.STATE["records"][k2]["status"])
+        self.assertGreater(srv.STATE["records"][k2]["checked_at"], 0.0)
+        self.assertEqual(4, srv.STATE["records"][k2]["player_num"])
 
 
 if __name__ == "__main__":
