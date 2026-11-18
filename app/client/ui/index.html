@@ -1581,7 +1581,7 @@ function dismissBatchResult() {
 function showBatchResult(rows, mode = "enroll") {
   const isCancel = mode === "cancel";
   const counts = {ok:0, skip:0, fail:0, pending:0};
-  const labels = {ok:"成功", skip:isCancel ? "未报名，跳过" : "已报名，跳过", fail:"失败", pending:"待确认"};
+  const labels = {ok:"成功", skip:isCancel ? "跳过" : "已报名，跳过", fail:"失败", pending:"待确认"};
   $("batchTitle").textContent = isCancel ? "批量取消结果" : "批量报名结果";
   $("batchDetails").setAttribute("aria-label", isCancel ? "逐项取消结果" : "逐项报名结果");
   for (const row of rows) counts[row.result]++;
@@ -1721,7 +1721,8 @@ async function runBatchAction(mode) {
       const row = matches.length === 1 ? matches[0] : null;
       const result = row && ["ok", "skip", "fail"].includes(row.result) ? row.result : "pending";
       return {...pair, result, reason:result === "fail" ? String(row.reason || (isCancel ? "取消失败，未提供原因" : "报名失败，未提供原因")) :
-        result === "pending" ? (requestError || "未取得明确结果") : ""};
+        result === "pending" ? (requestError || "未取得明确结果") :
+        (isCancel && result === "skip" && typeof row?.reason === "string" ? row.reason.trim() : "")};
     });
     showBatchResult(rows, batchAction);
 

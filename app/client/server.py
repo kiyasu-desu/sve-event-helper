@@ -168,6 +168,13 @@ REMOTE_FILE = os.path.join(DATA_DIR, "remote.json")
 RECORD_TTL = 60
 RECORDS_REFRESHING = {"flag": False}
 
+# Guardrails for batch cancellation: stay under AgentLink.endpoint()'s 90s proxy timeout
+# even if the final in-flight item hits upstream detail+cancel timeouts, and serialize
+# explicit enrollments with cancellations on the same (account_id, tournament_id) key.
+BATCH_CANCEL_BUDGET = 40.0
+_PAIR_LOCK_GUARD = threading.Lock()
+_PAIR_LOCKS = {}
+
 # One independent worker, using credential snapshots so profile I/O never holds
 # the live Account's credential lock (which is also used by signup).
 PROFILE_JOBS = {}
@@ -1920,71 +1927,85 @@ def api_enroll():
         return jsonify({"ok": False, "error": str(e)})
 
     acc = c.account
-    try:
-        it = c.detail(tid)
-    except SveError as e:
-        return jsonify({"account_id": acc.account_id, "ok": False, "error": str(e)})
+    key = sub_key(acc.account_id, tid)
+    with LOCK:
+        conflict = _cancel_conflict_reason_locked(key)
+        if conflict:
+            return jsonify({"account_id": acc.account_id, "ok": False,
+                            "code": "batch_cancel_conflict", "error": conflict})
+        cancel_epoch = STATE.get("cancel_epochs", {}).get(key, 0)
 
-    own = it.get("zh_user_status")
-    name = it.get("name")
-    if is_already_in_status(own):
-        # 「已报名」以及已报名账号进入签到阶段后的「签到中」。
-        log("直接报名：%s 已是 %r，无需操作" % (name, own))
-        return jsonify({"account_id": acc.account_id, "ok": True, "already": True, "status": own,
-                        "message": "该账号已是「%s」状态" % own})
-    if not is_signable_item(it):
-        return jsonify({"account_id": acc.account_id, "ok": False, "status": own,
-                        "error": "当前状态为 %r，并非可提交报名/补录的状态，未提交" % own})
-
-    # 窗口前置校验。
-    #
-    # 服务端的「可报名」只表示"你与这场赛事的关系"，与窗口是否到点无关：
-    # 每日时段型（如大奖赛 16:00~23:59）在窗口外**同样**返回「可报名」，
-    # 此时直接提交会被上游拒绝，用户看到的是含糊的"提交失败: 非报名时间"。
-    # 这里提前拦下并给出可操作的指引——本来就要取 detail，所以零额外成本。
-    #
-    # ⚠️ 例外：**补录**类状态（赛事处于签到→开赛之间，官方 App 显示为「可补录」）
-    #    与常规窗口无关——它本身就意味着此刻服务端允许补报。所以窗口门控
-    #    只对非补录状态生效，否则用户点了「立即报名」会被这里误拦。
-    w = window_from_detail(it)
-    if not w.is_open() and not (is_makeup_status(own) or is_makeup_opportunity(it)):
-        nxt = w.opens_at()
-        log("直接报名被拒：%s 窗口未开放（%s）" % (name, w.describe()))
-        return jsonify({
-            "ok": False, "status": own, "window": w.describe(),
-            "opens_at": nxt.strftime("%Y-%m-%d %H:%M") if nxt else None,
-            "error": "报名窗口尚未开放（%s）。请改用「订阅」，到时由调度器自动报名。"
-                     % w.describe()})
-
-    try:
-        c.signup(tid)
-    except SveError as e:
-        log("直接报名失败 %s：%s" % (name, e))
-        return jsonify({"account_id": acc.account_id, "ok": False, "error": "提交失败: %s" % e})
-
-    # 立即复核：状态类失败直接判定；网络类错误在窗口内重试
-    deadline = time.time() + 20
-    last = ""
-    status = None
-    while time.time() < deadline:
+    with _pair_action_lock(key):
+        with LOCK:
+            conflict = _cancel_conflict_reason_locked(key, cancel_epoch)
+            if conflict:
+                return jsonify({"account_id": acc.account_id, "ok": False,
+                                "code": "batch_cancel_conflict", "error": conflict})
         try:
-            after = c.detail(tid)
-            status = after.get("zh_user_status")
-            # 补录提交成功后，状态往往直接变成「签到中」（已报名、正在签到），
-            # 而不是「已报名」——所以两者都算复核通过。
-            if is_already_in_status(status):
-                add_record(acc.account_id, acc.uid, tid, name, source="手动报名",
-                           status=status)
-                log("直接报名成功：%s @ %s（复核状态 %r）" % (name, acc.account_id, status))
-                return jsonify({"account_id": acc.account_id, "ok": True, "status": status,
-                                "message": "报名成功（已复核为「%s」）" % status})
-        except Exception as e:
-            last = str(e)
-        time.sleep(2)
+            it = c.detail(tid)
+        except SveError as e:
+            return jsonify({"account_id": acc.account_id, "ok": False, "error": str(e)})
 
-    log("直接报名未确认：%s 状态=%r %s" % (name, status, last))
-    return jsonify({"account_id": acc.account_id, "ok": False, "status": status,
-                    "error": "已提交，但复核未确认成功（状态=%r）%s" % (status, last)})
+        own = it.get("zh_user_status")
+        name = it.get("name")
+        if is_already_in_status(own):
+            # 「已报名」以及已报名账号进入签到阶段后的「签到中」。
+            log("直接报名：%s 已是 %r，无需操作" % (name, own))
+            return jsonify({"account_id": acc.account_id, "ok": True, "already": True, "status": own,
+                            "message": "该账号已是「%s」状态" % own})
+        if not is_signable_item(it):
+            return jsonify({"account_id": acc.account_id, "ok": False, "status": own,
+                            "error": "当前状态为 %r，并非可提交报名/补录的状态，未提交" % own})
+
+        # 窗口前置校验。
+        #
+        # 服务端的「可报名」只表示"你与这场赛事的关系"，与窗口是否到点无关：
+        # 每日时段型（如大奖赛 16:00~23:59）在窗口外**同样**返回「可报名」，
+        # 此时直接提交会被上游拒绝，用户看到的是含糊的"提交失败: 非报名时间"。
+        # 这里提前拦下并给出可操作的指引——本来就要取 detail，所以零额外成本。
+        #
+        # ⚠️ 例外：**补录**类状态（赛事处于签到→开赛之间，官方 App 显示为「可补录」）
+        #    与常规窗口无关——它本身就意味着此刻服务端允许补报。所以窗口门控
+        #    只对非补录状态生效，否则用户点了「立即报名」会被这里误拦。
+        w = window_from_detail(it)
+        if not w.is_open() and not (is_makeup_status(own) or is_makeup_opportunity(it)):
+            nxt = w.opens_at()
+            log("直接报名被拒：%s 窗口未开放（%s）" % (name, w.describe()))
+            return jsonify({
+                "ok": False, "status": own, "window": w.describe(),
+                "opens_at": nxt.strftime("%Y-%m-%d %H:%M") if nxt else None,
+                "error": "报名窗口尚未开放（%s）。请改用「订阅」，到时由调度器自动报名。"
+                         % w.describe()})
+
+        try:
+            c.signup(tid)
+        except SveError as e:
+            log("直接报名失败 %s：%s" % (name, e))
+            return jsonify({"account_id": acc.account_id, "ok": False, "error": "提交失败: %s" % e})
+
+        # 立即复核：状态类失败直接判定；网络类错误在窗口内重试
+        deadline = time.time() + 20
+        last = ""
+        status = None
+        while time.time() < deadline:
+            try:
+                after = c.detail(tid)
+                status = after.get("zh_user_status")
+                # 补录提交成功后，状态往往直接变成「签到中」（已报名、正在签到），
+                # 而不是「已报名」——所以两者都算复核通过。
+                if is_already_in_status(status):
+                    add_record(acc.account_id, acc.uid, tid, name, source="手动报名",
+                               status=status)
+                    log("直接报名成功：%s @ %s（复核状态 %r）" % (name, acc.account_id, status))
+                    return jsonify({"account_id": acc.account_id, "ok": True, "status": status,
+                                    "message": "报名成功（已复核为「%s」）" % status})
+            except Exception as e:
+                last = str(e)
+            time.sleep(2)
+
+        log("直接报名未确认：%s 状态=%r %s" % (name, status, last))
+        return jsonify({"account_id": acc.account_id, "ok": False, "status": status,
+                        "error": "已提交，但复核未确认成功（状态=%r）%s" % (status, last)})
 
 
 def _parse_batch_request(body: dict):
@@ -2052,68 +2073,111 @@ def api_batch_enroll():
             continue
         c = SveClient(acc)
         for tid in tids:
-            try:
-                it = c.detail(tid)
-            except SveError as e:
+            key = sub_key(aname, tid)
+            with LOCK:
+                conflict = _cancel_conflict_reason_locked(key)
+                cancel_epoch = STATE.get("cancel_epochs", {}).get(key, 0)
+            if conflict:
                 results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid,
-                                "result": "fail", "reason": str(e)})
+                                "result": "fail", "reason": conflict})
                 continue
-            own = it.get("zh_user_status")
-            nm = it.get("name") or tid
-            if is_already_in_status(own):
-                # 「已报名」以及已报名账号进入签到阶段后的「签到中」——
-                # 两者都表示该账号已在这场赛事里，跳过而非失败。
+            with _pair_action_lock(key):
+                with LOCK:
+                    conflict = _cancel_conflict_reason_locked(key, cancel_epoch)
+                if conflict:
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid,
+                                    "result": "fail", "reason": conflict})
+                    continue
+                try:
+                    it = c.detail(tid)
+                except SveError as e:
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid,
+                                    "result": "fail", "reason": str(e)})
+                    continue
+                own = it.get("zh_user_status")
+                nm = it.get("name") or tid
+                if is_already_in_status(own):
+                    # 「已报名」以及已报名账号进入签到阶段后的「签到中」——
+                    # 两者都表示该账号已在这场赛事里，跳过而非失败。
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
+                                    "result": "skip", "reason": "已在该赛事中（%s）" % own})
+                    continue
+                if not is_signable_item(it):
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
+                                    "result": "fail", "reason": "当前状态为 %r" % own})
+                    continue
+                w = window_from_detail(it)
+                # 补录机会与常规窗口无关（赛事处于签到→开赛之间、仍有余位，
+                # 官方 App 显示为「可补录」），因此窗口门控只对**非补录**生效。
+                if not w.is_open() and not (is_makeup_status(own) or is_makeup_opportunity(it)):
+                    nxt = w.opens_at()
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
+                                    "result": "fail",
+                                    "reason": "报名窗口未开放（%s）%s"
+                                              % (w.describe(),
+                                                 ("，下次开放 " + nxt.strftime("%Y-%m-%d %H:%M")) if nxt else "")})
+                    continue
+                try:
+                    c.signup(tid)
+                except SveError as e:
+                    results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
+                                    "result": "fail", "reason": str(e)})
+                    continue
+                # 提交后复核：不谎报成功
+                ok2, why = False, ""
+                try:
+                    it2 = c.detail(tid)
+                    # 补录成功后状态常为「签到中」而非「已报名」，两者都算通过。
+                    ok2 = is_already_in_status(it2.get("zh_user_status"))
+                    if not ok2:
+                        why = "提交后复核状态为 %r" % it2.get("zh_user_status")
+                except SveError as e:
+                    why = "提交后复核失败：%s" % e
                 results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
-                                "result": "skip", "reason": "已在该赛事中（%s）" % own})
-                continue
-            if not is_signable_item(it):
-                results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
-                                "result": "fail", "reason": "当前状态为 %r" % own})
-                continue
-            w = window_from_detail(it)
-            # 补录机会与常规窗口无关（赛事处于签到→开赛之间、仍有余位，
-            # 官方 App 显示为「可补录」），因此窗口门控只对**非补录**生效。
-            if not w.is_open() and not (is_makeup_status(own) or is_makeup_opportunity(it)):
-                nxt = w.opens_at()
-                results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
-                                "result": "fail",
-                                "reason": "报名窗口未开放（%s）%s"
-                                          % (w.describe(),
-                                             ("，下次开放 " + nxt.strftime("%Y-%m-%d %H:%M")) if nxt else "")})
-                continue
-            try:
-                c.signup(tid)
-            except SveError as e:
-                results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
-                                "result": "fail", "reason": str(e)})
-                continue
-            # 提交后复核：不谎报成功
-            ok2, why = False, ""
-            try:
-                it2 = c.detail(tid)
-                # 补录成功后状态常为「签到中」而非「已报名」，两者都算通过。
-                ok2 = is_already_in_status(it2.get("zh_user_status"))
-                if not ok2:
-                    why = "提交后复核状态为 %r" % it2.get("zh_user_status")
-            except SveError as e:
-                why = "提交后复核失败：%s" % e
-            results.append({"account_id": aname, "account": account_label(aname), "tournament_id": tid, "name": nm,
-                            "result": "ok" if ok2 else "fail",
-                            "reason": "" if ok2 else why})
-            if ok2:
-                add_record(aname, acc.uid, tid, nm, source="批量报名", status=it2.get("zh_user_status"))
-            log("批量报名：%s → %s（%s）" % (aname, nm, "成功" if ok2 else "复核未通过"))
+                                "result": "ok" if ok2 else "fail",
+                                "reason": "" if ok2 else why})
+                if ok2:
+                    add_record(aname, acc.uid, tid, nm, source="批量报名", status=it2.get("zh_user_status"))
+                log("批量报名：%s → %s（%s）" % (aname, nm, "成功" if ok2 else "复核未通过"))
 
     return _batch_response("批量报名", results)
 
 
-def _check_cancel_subscribe_conflict_locked(key: str, expected_epoch=None):
+@contextlib.contextmanager
+def _pair_action_lock(key: str):
+    """Serialize explicit enroll and batch-cancel mutations on the same `(aid, tid)` key."""
+    with _PAIR_LOCK_GUARD:
+        entry = _PAIR_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _PAIR_LOCKS[key] = entry
+        entry[1] += 1
+    acquired = False
+    try:
+        entry[0].acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            entry[0].release()
+        with _PAIR_LOCK_GUARD:
+            entry[1] -= 1
+            if entry[1] <= 0 and _PAIR_LOCKS.get(key) is entry:
+                _PAIR_LOCKS.pop(key, None)
+
+
+def _cancel_conflict_reason_locked(key: str, expected_epoch=None):
     if key in STATE.get("batch_cancel_keys", {}):
-        return jsonify({"ok": False, "code": "subscription_conflict",
-                        "error": "该赛事正在执行批量取消，请稍后重试"})
+        return "该赛事正在执行批量取消，请稍后重试"
     if expected_epoch is not None and STATE.get("cancel_epochs", {}).get(key, 0) != expected_epoch:
-        return jsonify({"ok": False, "code": "subscription_conflict",
-                        "error": "该赛事与批量取消操作重叠，订阅已失效，请稍后重试"})
+        return "该赛事与批量取消操作重叠，请求已失效，请稍后重试"
+    return None
+
+
+def _check_cancel_subscribe_conflict_locked(key: str, expected_epoch=None):
+    reason = _cancel_conflict_reason_locked(key, expected_epoch)
+    if reason:
+        return jsonify({"ok": False, "code": "subscription_conflict", "error": reason})
     return None
 
 
@@ -2150,6 +2214,21 @@ def _quiesce_subscription(key: str):
                     holds[key] -= 1
 
 
+def _batch_cancel_timeout_row(aid: str, tid: str, *, name: str = "", submitted: bool = False) -> dict:
+    row = {
+        "account_id": aid,
+        "account": account_label(aid),
+        "tournament_id": tid,
+        "result": "fail",
+        "reason": "批量处理耗时已达上限，%s；请减少单批数量或重试剩余项" % (
+            "未提交取消" if submitted else "未执行"
+        ),
+    }
+    if name:
+        row["name"] = name
+    return row
+
+
 @app.post("/api/batch_cancel")
 def api_batch_cancel():
     """批量取消报名 / 取消预约：仅对「已报名」「已预约」执行取消并做快速复核。"""
@@ -2157,6 +2236,7 @@ def api_batch_cancel():
     if err is not None:
         return err
 
+    deadline = time.monotonic() + BATCH_CANCEL_BUDGET
     results = []
     for aid in accts:
         acc = STATE["accounts"].get(aid)
@@ -2167,73 +2247,83 @@ def api_batch_cancel():
             continue
         c = SveClient(acc)
         for tid in tids:
+            if time.monotonic() >= deadline:
+                results.append(_batch_cancel_timeout_row(aid, tid))
+                continue
             key = sub_key(aid, tid)
-            with _quiesce_subscription(key) as sched_candidates:
-                try:
-                    it = c.detail(tid)
-                except SveError as e:
-                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                    "result": "fail", "reason": str(e)})
+            with _pair_action_lock(key):
+                if time.monotonic() >= deadline:
+                    results.append(_batch_cancel_timeout_row(aid, tid))
                     continue
-                own = it.get("zh_user_status")
-                nm = it.get("name") or tid
-                # 规则 A：仅官方状态为「已报名」「已预约」才执行取消；其余状态一律 skip。
-                if own not in ("已报名", "已预约"):
-                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                    "name": nm, "result": "skip",
-                                    "reason": "未报名或不可取消（%s）" % (own or "未知状态")})
-                    continue
-                try:
-                    c.cancel(tid)
-                except SveError as e:
-                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                    "name": nm, "result": "fail", "reason": str(e)})
-                    continue
-                ok2, why, after = False, "", None
-                try:
-                    it2 = c.detail(tid)
-                    after = it2.get("zh_user_status")
-                    if after in ("已报名", "已预约"):
-                        time.sleep(0.5)
+                with _quiesce_subscription(key) as sched_candidates:
+                    try:
+                        it = c.detail(tid)
+                    except SveError as e:
+                        results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                        "result": "fail", "reason": str(e)})
+                        continue
+                    own = it.get("zh_user_status")
+                    nm = it.get("name") or tid
+                    # 规则 A：仅官方状态为「已报名」「已预约」才执行取消；其余状态一律 skip。
+                    if own not in ("已报名", "已预约"):
+                        results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                        "name": nm, "result": "skip",
+                                        "reason": "当前状态不可取消（%s）" % (own or "未知状态")})
+                        continue
+                    if time.monotonic() >= deadline:
+                        results.append(_batch_cancel_timeout_row(aid, tid, name=nm, submitted=True))
+                        continue
+                    try:
+                        c.cancel(tid)
+                    except SveError as e:
+                        results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                        "name": nm, "result": "fail", "reason": str(e)})
+                        continue
+                    ok2, why, after = False, "", None
+                    try:
                         it2 = c.detail(tid)
                         after = it2.get("zh_user_status")
-                    ok2 = after not in ("已报名", "已预约")
-                    if not ok2:
-                        why = "提交后复核状态仍为 %r" % after
-                except SveError as e:
-                    why = "提交后复核失败：%s" % e
-                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                "name": nm, "result": "ok" if ok2 else "fail",
-                                "reason": "" if ok2 else why})
-                if ok2:
-                    # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
-                    stopped = []
-                    sub = None
-                    with LOCK:
-                        dirty = False
-                        if key in STATE["schedulers"] or key in STATE["subs"]:
-                            popped = STATE["schedulers"].pop(key, None)
-                            if popped is not None:
-                                stopped.append(popped)
-                            sub = STATE["subs"].pop(key, None)
-                            dirty = True
-                        for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *sched_candidates):
-                            if candidate is not None and all(candidate is not existing for existing in stopped):
-                                stopped.append(candidate)
-                        rec = STATE["records"].get(key)
-                        _bump_record_epoch_locked(key)
-                        if rec is not None:
-                            rec["status"] = after or "已取消"
-                            rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                            rec["checked_at"] = time.time()
-                            dirty = True
-                        if dirty:
-                            persist_dataset()
-                    for sched in stopped:
-                        sched.stop()
-                    if sub or stopped:
-                        log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
-                log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
+                        if after in ("已报名", "已预约"):
+                            time.sleep(0.5)
+                            it2 = c.detail(tid)
+                            after = it2.get("zh_user_status")
+                        ok2 = after not in ("已报名", "已预约")
+                        if not ok2:
+                            why = "提交后复核状态仍为 %r" % after
+                    except SveError as e:
+                        why = "提交后复核失败：%s" % e
+                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                    "name": nm, "result": "ok" if ok2 else "fail",
+                                    "reason": "" if ok2 else why})
+                    if ok2:
+                        # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
+                        stopped = []
+                        sub = None
+                        with LOCK:
+                            dirty = False
+                            if key in STATE["schedulers"] or key in STATE["subs"]:
+                                popped = STATE["schedulers"].pop(key, None)
+                                if popped is not None:
+                                    stopped.append(popped)
+                                sub = STATE["subs"].pop(key, None)
+                                dirty = True
+                            for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *sched_candidates):
+                                if candidate is not None and all(candidate is not existing for existing in stopped):
+                                    stopped.append(candidate)
+                            rec = STATE["records"].get(key)
+                            _bump_record_epoch_locked(key)
+                            if rec is not None:
+                                rec["status"] = after or "已取消"
+                                rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                rec["checked_at"] = time.time()
+                                dirty = True
+                            if dirty:
+                                persist_dataset()
+                        for sched in stopped:
+                            sched.stop()
+                        if sub or stopped:
+                            log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
+                    log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
 
     return _batch_response("批量取消", results)
 

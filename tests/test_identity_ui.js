@@ -1791,7 +1791,7 @@ test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, 
     calls.push([url,JSON.parse(opts.body)]);
     return {json:async()=>({ok:true,results:[
       {account_id:'10001',tournament_id:'test-ok',result:'ok',reason:''},
-      {account_id:'10001',tournament_id:'test-skip',result:'skip',reason:'未报名或不可取消（签到中）'},
+      {account_id:'10001',tournament_id:'test-skip',result:'skip',reason:'当前状态不可取消（签到中）<script>'},
       {account_id:'10001',tournament_id:'test-fail',result:'fail',reason:'test-cancel-failed'},
     ]})};
   };
@@ -1813,8 +1813,8 @@ test('batch cancel confirms pairs, posts /api/batch_cancel, renders skip label, 
   assert.match(h.elements.get('actionStatus').textContent,/^批量取消结果：成功 1/);
   const detail=h.elements.get('batchDetails').innerHTML;
   assert.match(detail,/test-ok-name：成功<\/p>/);
-  assert.match(detail,/test-skip-name：未报名，跳过<\/p>/);
-  assert.doesNotMatch(detail,/已报名，跳过|未报名或不可取消/);
+  assert.match(detail,/test-skip-name：跳过：当前状态不可取消（签到中）&lt;script&gt;<\/p>/);
+  assert.doesNotMatch(detail,/已报名，跳过|未报名，跳过|<script>/);
   assert.match(detail,/test-fail-name：失败：test-cancel-failed<\/p>/);
 
   assert.equal(okPick.checked,false);

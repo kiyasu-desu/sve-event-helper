@@ -262,7 +262,7 @@ class BatchCancelTests(unittest.TestCase):
                 self.assertEqual({"ok": 0, "skip": 1, "fail": 0, "total": 1}, res["summary"])
                 row = res["results"][0]
                 self.assertEqual("skip", row["result"])
-                self.assertEqual("未报名或不可取消（%s）" % (status or "未知状态"), row["reason"])
+                self.assertEqual("当前状态不可取消（%s）" % (status or "未知状态"), row["reason"])
                 cancel.assert_not_called()
                 sched.stop.assert_not_called()
                 self.assertIn(key, srv.STATE["subs"])
@@ -1121,6 +1121,231 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             batch_thread.join(timeout=5)
 
         self.assertEqual("ok", batch_box["res"]["results"][0]["result"])
+
+    def test_batch_cancel_serializes_with_inflight_explicit_enroll_and_batch_enroll(self):
+        srv = self.srv
+        key, tid, tid2 = "10001|test-enroll-race", "test-enroll-race", "test-enroll-other"
+        state_lock = threading.Lock()
+        server_state = {tid: "可报名", tid2: "可报名"}
+        enroll_signup_entered = threading.Event()
+        release_enroll_signup = threading.Event()
+        cancel_calls = []
+        self.addCleanup(release_enroll_signup.set)
+
+        def detail(client, qtid):
+            with state_lock:
+                st = server_state[qtid]
+            return {"name": qtid, "zh_user_status": st, "player_num": 1, "max_player_number": 8,
+                    "start_time": "2000-01-01 00:00:00", "end_time": "2099-12-31 23:59:59"}
+
+        def signup(client, qtid):
+            if qtid == tid and threading.current_thread().name == "explicit-enroll-1":
+                enroll_signup_entered.set()
+                release_enroll_signup.wait(timeout=5)
+            with state_lock:
+                server_state[qtid] = "已报名"
+
+        def cancel(client, qtid):
+            cancel_calls.append(qtid)
+            with state_lock:
+                server_state[qtid] = "可报名"
+
+        # Case 1: in-flight /api/enroll finishes before batch_cancel queries & cancels the pair.
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "signup", autospec=True, side_effect=signup), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            enroll_box = {}
+            enroll_thread = threading.Thread(
+                target=lambda: enroll_box.__setitem__("res", self._post(
+                    "/api/enroll", {"account_id": "10001", "tournament_id": tid}
+                )),
+                daemon=True,
+                name="explicit-enroll-1",
+            )
+            enroll_thread.start()
+            self.assertTrue(enroll_signup_entered.wait(timeout=5))
+
+            cancel_box = {}
+            cancel_thread = threading.Thread(
+                target=lambda: cancel_box.__setitem__("res", self._post(
+                    "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                )),
+                daemon=True,
+                name="batch-cancel-after-enroll",
+            )
+            cancel_thread.start()
+            threading.Event().wait(0.05)
+            self.assertEqual([], cancel_calls)
+
+            release_enroll_signup.set()
+            enroll_thread.join(timeout=5)
+            cancel_thread.join(timeout=5)
+
+        self.assertTrue(enroll_box["res"]["ok"])
+        self.assertEqual("ok", cancel_box["res"]["results"][0]["result"])
+        self.assertEqual([tid], cancel_calls)
+        self.assertEqual("可报名", server_state[tid])
+
+        # Case 2: active batch_cancel blocks concurrent /api/enroll and same-key /api/batch_enroll
+        # without blocking unrelated tournament tid2.
+        with state_lock:
+            server_state[tid] = "已报名"
+            server_state[tid2] = "可报名"
+        cancel_entered = threading.Event()
+        release_cancel = threading.Event()
+        blocked_signups = []
+        self.addCleanup(release_cancel.set)
+
+        def cancel_blocking(client, qtid):
+            cancel_entered.set()
+            release_cancel.wait(timeout=5)
+            with state_lock:
+                server_state[qtid] = "可报名"
+
+        def signup_track(client, qtid):
+            blocked_signups.append(qtid)
+            with state_lock:
+                server_state[qtid] = "已报名"
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "signup", autospec=True, side_effect=signup_track), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel_blocking):
+            batch_cancel_box = {}
+            t_cancel = threading.Thread(
+                target=lambda: batch_cancel_box.__setitem__("res", self._post(
+                    "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                )),
+                daemon=True,
+            )
+            t_cancel.start()
+            self.assertTrue(cancel_entered.wait(timeout=5))
+
+            r_enroll = self._post("/api/enroll", {"account_id": "10001", "tournament_id": tid})
+            self.assertFalse(r_enroll["ok"])
+            self.assertEqual("batch_cancel_conflict", r_enroll["code"])
+
+            r_batch_enroll = self._post("/api/batch_enroll", {"account_ids": ["10001"], "tournaments": [tid, tid2]})
+            self.assertEqual("fail", r_batch_enroll["results"][0]["result"])
+            self.assertEqual("ok", r_batch_enroll["results"][1]["result"])
+            self.assertEqual([tid2], blocked_signups)
+
+            release_cancel.set()
+            t_cancel.join(timeout=5)
+
+        self.assertEqual("ok", batch_cancel_box["res"]["results"][0]["result"])
+        self.assertEqual("可报名", server_state[tid])
+        self.assertEqual({}, srv._PAIR_LOCKS)
+
+    def test_enroll_that_entered_before_cancel_commit_is_rejected_without_resignup(self):
+        srv = self.srv
+        tid = "test-enroll-overlap"
+        server_state = {"status": "已报名"}
+        real_pair_lock = srv._pair_action_lock
+        enroll_at_lock = threading.Event()
+        release_enroll = threading.Event()
+        upstream_calls = []
+        self.addCleanup(release_enroll.set)
+
+        def wrapped_pair_lock(key):
+            if threading.current_thread().name == "enroll-overlap":
+                enroll_at_lock.set()
+                release_enroll.wait(timeout=5)
+            return real_pair_lock(key)
+
+        def detail(client, qtid):
+            upstream_calls.append(("detail", threading.current_thread().name))
+            return {"name": qtid, "zh_user_status": server_state["status"], "player_num": 1, "max_player_number": 8,
+                    "start_time": "2000-01-01 00:00:00", "end_time": "2099-12-31 23:59:59"}
+
+        def cancel(client, qtid):
+            upstream_calls.append(("cancel", threading.current_thread().name))
+            server_state["status"] = "可报名"
+
+        with patch.object(srv, "_pair_action_lock", side_effect=wrapped_pair_lock), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel), \
+                patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not signup")):
+            enroll_box = {}
+            t_enroll = threading.Thread(
+                target=lambda: enroll_box.__setitem__("res", self._post(
+                    "/api/enroll", {"account_id": "10001", "tournament_id": tid}
+                )),
+                daemon=True,
+                name="enroll-overlap",
+            )
+            t_enroll.start()
+            self.assertTrue(enroll_at_lock.wait(timeout=5))
+
+            cancel_res = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]})
+            self.assertEqual("ok", cancel_res["results"][0]["result"])
+
+            release_enroll.set()
+            t_enroll.join(timeout=5)
+
+        self.assertFalse(enroll_box["res"]["ok"])
+        self.assertEqual("batch_cancel_conflict", enroll_box["res"]["code"])
+        self.assertFalse(any(tname == "enroll-overlap" for _, tname in upstream_calls))
+        self.assertEqual("可报名", server_state["status"])
+
+    def test_batch_cancel_stops_at_budget_without_orphan_upstream_work(self):
+        srv = self.srv
+        tids = ["test-b1", "test-b2", "test-b3", "test-b4"]
+        for tid in tids:
+            key = f"10001|{tid}"
+            srv.STATE["subs"][key] = {"account_id": "10001", "uid": 10001, "tournament_id": tid, "name": tid}
+        srv.persist_subs()
+
+        server_status = {tid: "已报名" for tid in tids}
+        seen_calls = []
+
+        def detail(client, qtid):
+            seen_calls.append(("detail", qtid))
+            if qtid == "test-b1" and server_status[qtid] == "已报名":
+                threading.Event().wait(0.06)
+            return {"name": qtid, "zh_user_status": server_status[qtid], "player_num": 1, "max_player_number": 8}
+
+        def cancel(client, qtid):
+            seen_calls.append(("cancel", qtid))
+            server_status[qtid] = "可报名"
+
+        # Case 1: budget expires during detail() of test-b1 before cancel() -> zero cancels attempted.
+        with patch.object(srv, "BATCH_CANCEL_BUDGET", 0.03), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            res1 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": tids})
+
+        self.assertEqual(4, len(res1["results"]))
+        self.assertTrue(all(r["result"] == "fail" for r in res1["results"]))
+        self.assertEqual([("detail", "test-b1")], seen_calls)
+        self.assertIn("未提交取消", res1["results"][0]["reason"])
+        self.assertIn("未执行", res1["results"][1]["reason"])
+        for tid in tids:
+            self.assertIn(f"10001|{tid}", srv.STATE["subs"])
+
+        # Case 2: test-b1 completes cancel within budget; test-b2..b4 stop cleanly at budget cutoff.
+        seen_calls.clear()
+
+        def detail_fast(client, qtid):
+            seen_calls.append(("detail", qtid))
+            return {"name": qtid, "zh_user_status": server_status[qtid], "player_num": 1, "max_player_number": 8}
+
+        def cancel_slow_after_b1(client, qtid):
+            seen_calls.append(("cancel", qtid))
+            server_status[qtid] = "可报名"
+            threading.Event().wait(0.06)
+
+        with patch.object(srv, "BATCH_CANCEL_BUDGET", 0.04), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail_fast), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel_slow_after_b1):
+            res2 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": tids})
+
+        self.assertEqual("ok", res2["results"][0]["result"])
+        self.assertEqual(["fail", "fail", "fail"], [r["result"] for r in res2["results"][1:]])
+        self.assertNotIn("10001|test-b1", srv.STATE["subs"])
+        for tid in tids[1:]:
+            self.assertIn(f"10001|{tid}", srv.STATE["subs"])
+            self.assertNotIn(("cancel", tid), seen_calls)
+        self.assertEqual([("detail", "test-b1"), ("cancel", "test-b1"), ("detail", "test-b1")], seen_calls)
 
 
 if __name__ == "__main__":
