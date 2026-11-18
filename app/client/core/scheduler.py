@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import time
@@ -222,6 +223,31 @@ class Scheduler:
         self.attempts = 0
         self.state: dict = {}
         self.progress = Progress()
+        self._action_cond = threading.Condition()
+        self._action_in_flight = False
+        self._action_holds = 0
+        self._quiesce_seq = 0
+
+    @contextlib.contextmanager
+    def quiesce(self):
+        """Wait for any in-flight signup action to finish and hold new ones until exit."""
+        with self._action_cond:
+            self._action_holds += 1
+            self._quiesce_seq += 1
+            while self._action_in_flight:
+                self._action_cond.wait()
+        try:
+            yield
+        finally:
+            with self._action_cond:
+                self._action_holds = max(0, self._action_holds - 1)
+                self._action_cond.notify_all()
+
+    def _wait_if_held_locked(self) -> bool:
+        """Wait for any quiesce holds to clear; return False if stopped."""
+        while self._action_holds > 0 and not self.stop_flag.is_set():
+            self._action_cond.wait()
+        return not self.stop_flag.is_set()
 
     def _detail(self, phase):
         # A detail/signup may verify the official identity first (two requests).
@@ -307,6 +333,8 @@ class Scheduler:
     # ---- 单次尝试 ----
     def try_once(self) -> AttemptResult:
         res = AttemptResult()
+        with self._action_cond:
+            quiesce_seq = self._quiesce_seq
         if self.stop_flag.is_set():
             res.reason = "守护已停止"
             return res
@@ -325,6 +353,13 @@ class Scheduler:
 
         own = it.get("zh_user_status")
         if is_already_in_status(own):
+            with self._action_cond:
+                if not self._wait_if_held_locked():
+                    res.reason = "守护已停止"
+                    return res
+                if self._quiesce_seq != quiesce_seq:
+                    res.reason = "取消核查期间采样已作废，下轮重新查询"
+                    return res
             # 「已报名」，以及**已报名账号进入签到阶段**后的「签到中」。
             # 后者是实测结论（见 sveapi.is_already_in_status 的证据）：
             # 9 个账号里显示「签到中」的 5 个全都在参与记录里。
@@ -351,36 +386,49 @@ class Scheduler:
             res.reason = "自身状态为 %r，并非可提交报名/补录的状态，不提交" % own
             return res
 
-        res.attempted = True
-        self.attempts += 1
-        self.on_event("attempt", {"n": self.attempts, "before": pn})
-        if self.stop_flag.is_set():
-            res.attempted = False
-            res.reason = "守护已停止"
-            return res
+        with self._action_cond:
+            if not self._wait_if_held_locked():
+                res.reason = "守护已停止"
+                return res
+            if self._quiesce_seq != quiesce_seq:
+                res.reason = "取消核查期间采样已作废，下轮重新查询"
+                return res
+            self._action_in_flight = True
         try:
-            self.progress.enter("signup", 2 * TIMEOUT + 10)
-            self.progress.attempted()
-            self.client.signup(self.tid)
-            self.progress.result(True, "signup")
-            res.reason = "已提交报名"
-        except SveError as e:
-            self.progress.result(False, "signup")
-            res.code = None if e.code is None else str(e.code)
-            res.reason = "提交失败: %s" % e
-            # 把 code 打进日志。这是判断"时间冲突对应哪个错误码"的**唯一途径**——
-            # 该冲突无法在本地复现（复现要真的提交报名），只能等真实遇到时从日志确认。
-            self.log("提交失败 code=%s" % (res.code or "（服务端未提供）"))
-            if looks_like_time_conflict(res.code, str(e)):
-                # 冲突不会自行消失 → 放弃守护，由 server.py 取消订阅并通知。
-                # ⚠️ 只有这一种失败会置 abort；其余失败一律继续等待。
-                res.abort = True
-                res.abort_reason = "与已报名赛事时间冲突"
-            return res
+            res.attempted = True
+            self.attempts += 1
+            self.on_event("attempt", {"n": self.attempts, "before": pn})
+            if self.stop_flag.is_set():
+                res.attempted = False
+                res.reason = "守护已停止"
+                return res
+            try:
+                self.progress.enter("signup", 2 * TIMEOUT + 10)
+                self.progress.attempted()
+                self.client.signup(self.tid)
+                self.progress.result(True, "signup")
+                res.reason = "已提交报名"
+            except SveError as e:
+                self.progress.result(False, "signup")
+                res.code = None if e.code is None else str(e.code)
+                res.reason = "提交失败: %s" % e
+                # 把 code 打进日志。这是判断"时间冲突对应哪个错误码"的**唯一途径**——
+                # 该冲突无法在本地复现（复现要真的提交报名），只能等真实遇到时从日志确认。
+                self.log("提交失败 code=%s" % (res.code or "（服务端未提供）"))
+                if looks_like_time_conflict(res.code, str(e)):
+                    # 冲突不会自行消失 → 放弃守护，由 server.py 取消订阅并通知。
+                    # ⚠️ 只有这一种失败会置 abort；其余失败一律继续等待。
+                    res.abort = True
+                    res.abort_reason = "与已报名赛事时间冲突"
+                return res
 
-        except Exception:
-            self.progress.result(False, "signup")
-            raise
+            except Exception:
+                self.progress.result(False, "signup")
+                raise
+        finally:
+            with self._action_cond:
+                self._action_in_flight = False
+                self._action_cond.notify_all()
 
         ok, status, why = self.confirm("立即复核", 15, 3)
         res.quick_status = status
@@ -396,6 +444,9 @@ class Scheduler:
         if not ok2:
             res.reason = why2
             self.on_event("unstable", {"reason": why2})
+            return res
+        if self.stop_flag.is_set():
+            res.reason = "守护已停止"
             return res
 
         res.ok = True
@@ -482,6 +533,8 @@ class Scheduler:
 
     def stop(self):
         self.stop_flag.set()
+        with self._action_cond:
+            self._action_cond.notify_all()
 
 
 def schedule_in_thread(scheduler: Scheduler) -> threading.Thread:
