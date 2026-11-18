@@ -2144,7 +2144,7 @@ def api_batch_enroll():
 
 
 @contextlib.contextmanager
-def _pair_action_lock(key: str):
+def _pair_action_lock(key: str, deadline=None):
     """Serialize explicit enroll and batch-cancel mutations on the same `(aid, tid)` key."""
     with _PAIR_LOCK_GUARD:
         entry = _PAIR_LOCKS.get(key)
@@ -2154,9 +2154,13 @@ def _pair_action_lock(key: str):
         entry[1] += 1
     acquired = False
     try:
-        entry[0].acquire()
-        acquired = True
-        yield
+        if deadline is None:
+            acquired = entry[0].acquire()
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                acquired = entry[0].acquire(timeout=remaining)
+        yield acquired
     finally:
         if acquired:
             entry[0].release()
@@ -2237,8 +2241,14 @@ def api_batch_cancel():
         return err
 
     deadline = time.monotonic() + BATCH_CANCEL_BUDGET
+    timed_out = False
     results = []
     for aid in accts:
+        if timed_out or time.monotonic() >= deadline:
+            timed_out = True
+            for tid in tids:
+                results.append(_batch_cancel_timeout_row(aid, tid))
+            continue
         acc = STATE["accounts"].get(aid)
         if not acc:
             for tid in tids:
@@ -2247,12 +2257,14 @@ def api_batch_cancel():
             continue
         c = SveClient(acc)
         for tid in tids:
-            if time.monotonic() >= deadline:
+            if timed_out or time.monotonic() >= deadline:
+                timed_out = True
                 results.append(_batch_cancel_timeout_row(aid, tid))
                 continue
             key = sub_key(aid, tid)
-            with _pair_action_lock(key):
-                if time.monotonic() >= deadline:
+            with _pair_action_lock(key, deadline=deadline) as acquired:
+                if not acquired or time.monotonic() >= deadline:
+                    timed_out = True
                     results.append(_batch_cancel_timeout_row(aid, tid))
                     continue
                 with _quiesce_subscription(key) as sched_candidates:
@@ -2271,6 +2283,7 @@ def api_batch_cancel():
                                         "reason": "当前状态不可取消（%s）" % (own or "未知状态")})
                         continue
                     if time.monotonic() >= deadline:
+                        timed_out = True
                         results.append(_batch_cancel_timeout_row(aid, tid, name=nm, submitted=True))
                         continue
                     try:
