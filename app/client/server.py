@@ -2358,41 +2358,43 @@ def api_cancel():
         return jsonify({"ok": False, "error": str(e)})
 
     acc = c.account
-    try:
-        it = c.detail(tid)
-    except SveError as e:
-        return jsonify({"account_id": acc.account_id, "ok": False, "error": str(e)})
-
-    own = it.get("zh_user_status")
-    name = it.get("name")
-    if own not in ("已报名", "已预约"):
-        return jsonify({"account_id": acc.account_id, "ok": False, "status": own,
-                        "error": "当前状态为 %r，无可取消的报名/预约" % own})
-
-    try:
-        c.cancel(tid)
-    except SveError as e:
-        log("取消报名失败 %s：%s" % (name, e))
-        return jsonify({"account_id": acc.account_id, "ok": False, "error": "提交失败: %s" % e})
-
-    deadline = time.time() + 20
-    status = None
-    last = ""
-    while time.time() < deadline:
+    key = sub_key(acc.account_id, tid)
+    with _pair_action_lock(key):
         try:
-            after = c.detail(tid)
-            status = after.get("zh_user_status")
-            if status not in ("已报名", "已预约"):
-                log("已取消报名：%s @ %s（现状态 %s）" % (name, acc.account_id, status))
-                return jsonify({"account_id": acc.account_id, "ok": True, "status": status,
-                                "message": "已取消（复核状态：%s）" % status})
-        except Exception as e:
-            last = str(e)
-        time.sleep(2)
+            it = c.detail(tid)
+        except SveError as e:
+            return jsonify({"account_id": acc.account_id, "ok": False, "error": str(e)})
 
-    log("取消报名未确认：%s 状态=%r %s" % (name, status, last))
-    return jsonify({"account_id": acc.account_id, "ok": False, "status": status,
-                    "error": "已提交，但复核时状态仍为 %r" % status})
+        own = it.get("zh_user_status")
+        name = it.get("name")
+        if own not in ("已报名", "已预约"):
+            return jsonify({"account_id": acc.account_id, "ok": False, "status": own,
+                            "error": "当前状态为 %r，无可取消的报名/预约" % own})
+
+        try:
+            c.cancel(tid)
+        except SveError as e:
+            log("取消报名失败 %s：%s" % (name, e))
+            return jsonify({"account_id": acc.account_id, "ok": False, "error": "提交失败: %s" % e})
+
+        deadline = time.time() + 20
+        status = None
+        last = ""
+        while time.time() < deadline:
+            try:
+                after = c.detail(tid)
+                status = after.get("zh_user_status")
+                if status not in ("已报名", "已预约"):
+                    log("已取消报名：%s @ %s（现状态 %s）" % (name, acc.account_id, status))
+                    return jsonify({"account_id": acc.account_id, "ok": True, "status": status,
+                                    "message": "已取消（复核状态：%s）" % status})
+            except Exception as e:
+                last = str(e)
+            time.sleep(2)
+
+        log("取消报名未确认：%s 状态=%r %s" % (name, status, last))
+        return jsonify({"account_id": acc.account_id, "ok": False, "status": status,
+                        "error": "已提交，但复核时状态仍为 %r" % status})
 
 
 @app.get("/api/records")

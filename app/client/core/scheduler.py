@@ -388,6 +388,10 @@ class Scheduler:
             res.attempted = True
             self.attempts += 1
             self.on_event("attempt", {"n": self.attempts, "before": pn})
+            if self.stop_flag.is_set():
+                res.attempted = False
+                res.reason = "守护已停止"
+                return res
             try:
                 self.progress.enter("signup", 2 * TIMEOUT + 10)
                 self.progress.attempted()

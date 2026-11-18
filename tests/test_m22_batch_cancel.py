@@ -1407,6 +1407,136 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         self.assertEqual([], cancel_calls)
         self.assertEqual({}, srv._PAIR_LOCKS)
 
+    def test_batch_cancel_serializes_with_single_cancel_endpoint(self):
+        srv = self.srv
+        tid = "test-single-cancel-race"
+        state_lock = threading.Lock()
+        server_state = {"status": "已报名"}
+        cancel_entered = threading.Event()
+        release_cancel = threading.Event()
+        cancel_threads = []
+        self.addCleanup(release_cancel.set)
+
+        def detail(client, qtid):
+            with state_lock:
+                st = server_state["status"]
+            return {"name": qtid, "zh_user_status": st, "player_num": 1, "max_player_number": 8}
+
+        def cancel(client, qtid):
+            tname = threading.current_thread().name
+            cancel_threads.append(tname)
+            cancel_entered.set()
+            release_cancel.wait(timeout=5)
+            with state_lock:
+                server_state["status"] = "可报名"
+
+        # Case 1: in-flight /api/cancel finishes first; waiting /api/batch_cancel sees 可报名 and skips.
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            single_box = {}
+            t_single = threading.Thread(
+                target=lambda: single_box.__setitem__("res", self._post(
+                    "/api/cancel", {"account_id": "10001", "tournament_id": tid}
+                )),
+                daemon=True,
+                name="single-cancel-worker",
+            )
+            t_single.start()
+            self.addCleanup(lambda: (release_cancel.set(), t_single.join(timeout=3)))
+            self.assertTrue(cancel_entered.wait(timeout=5))
+
+            batch_box = {}
+            t_batch = threading.Thread(
+                target=lambda: batch_box.__setitem__("res", self._post(
+                    "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                )),
+                daemon=True,
+                name="batch-cancel-worker",
+            )
+            t_batch.start()
+            self.addCleanup(lambda: t_batch.join(timeout=3))
+            threading.Event().wait(0.05)
+            self.assertEqual(["single-cancel-worker"], cancel_threads)
+
+            release_cancel.set()
+            t_single.join(timeout=5)
+            t_batch.join(timeout=5)
+
+        self.assertTrue(single_box["res"]["ok"])
+        self.assertEqual("skip", batch_box["res"]["results"][0]["result"])
+        self.assertEqual(["single-cancel-worker"], cancel_threads)
+        self.assertEqual({}, srv._PAIR_LOCKS)
+
+        # Case 2: active /api/batch_cancel finishes first; waiting /api/cancel sees 可报名 and does not re-cancel.
+        server_state["status"] = "已报名"
+        cancel_threads.clear()
+        cancel_entered.clear()
+        release_cancel.clear()
+
+        with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel):
+            batch_box2 = {}
+            t_batch2 = threading.Thread(
+                target=lambda: batch_box2.__setitem__("res", self._post(
+                    "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid]}
+                )),
+                daemon=True,
+                name="batch-cancel-worker-2",
+            )
+            t_batch2.start()
+            self.addCleanup(lambda: t_batch2.join(timeout=3))
+            self.assertTrue(cancel_entered.wait(timeout=5))
+
+            single_box2 = {}
+            t_single2 = threading.Thread(
+                target=lambda: single_box2.__setitem__("res", self._post(
+                    "/api/cancel", {"account_id": "10001", "tournament_id": tid}
+                )),
+                daemon=True,
+                name="single-cancel-worker-2",
+            )
+            t_single2.start()
+            self.addCleanup(lambda: t_single2.join(timeout=3))
+            threading.Event().wait(0.05)
+            self.assertEqual(["batch-cancel-worker-2"], cancel_threads)
+
+            release_cancel.set()
+            t_batch2.join(timeout=5)
+            t_single2.join(timeout=5)
+
+        self.assertEqual("ok", batch_box2["res"]["results"][0]["result"])
+        self.assertFalse(single_box2["res"]["ok"])
+        self.assertEqual(["batch-cancel-worker-2"], cancel_threads)
+        self.assertEqual({}, srv._PAIR_LOCKS)
+
+    def test_scheduler_rechecks_stop_flag_after_attempt_callback_before_signup(self):
+        srv = self.srv
+        tid = "test-stop-on-attempt"
+        acc = srv.STATE["accounts"]["10001"]
+        events = []
+
+        def on_event(kind, data):
+            events.append(kind)
+            if kind == "attempt":
+                sched.stop()
+
+        sched = srv.Scheduler(srv.SveClient(acc), tid, second_confirm_delay=0,
+                              confirm_window=1, confirm_retry=0.01, on_event=on_event)
+
+        with patch.object(srv.SveClient, "detail", autospec=True, return_value={
+            "name": tid, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8
+        }), patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not signup")) as signup:
+            res = sched.try_once()
+
+        self.assertEqual(["sample", "attempt"], events)
+        self.assertFalse(res.attempted)
+        self.assertEqual("守护已停止", res.reason)
+        signup.assert_not_called()
+        with sched._action_cond:
+            self.assertFalse(sched._action_in_flight)
+        with sched.quiesce():
+            pass
+
 
 if __name__ == "__main__":
     unittest.main()
