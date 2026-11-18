@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -102,7 +103,7 @@ def _no_cache(resp):
 STATE = {
     "active": None,          # default account_id; browser choice is a per-client cookie
     "accounts": {},          # account_id -> Account
-    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "login_intents": {}, "storage_failed": False,
+    "pending": [], "tombstones": {}, "operations": {}, "workers": {}, "batch_cancel_keys": {}, "login_intents": {}, "storage_failed": False,
     # 订阅以 "(account_id, 赛事id)" 为键，不依赖可变昵称。
     # 早先用赛事id 作键，导致换账号后订阅被"改绑"，这是错误的。
     "subs": {},              # sub_key -> {account, uid, tournament_id, ..., logs: []}
@@ -155,6 +156,7 @@ def scheduler_thread(sched, key):
                 if STATE["workers"].get(key) is thread:
                     STATE["workers"].pop(key, None)
     thread = threading.Thread(target=run, daemon=True, name="sched-%s" % key)
+    thread._scheduler = sched
     STATE["scheduler_threads"].add(thread)
     STATE["workers"][key] = thread
     return thread
@@ -439,7 +441,8 @@ def _start_scheduler_for(key: str, s: dict, acc) -> bool:
     STORE._require_writer()
     with LOCK:
         if (remote_enabled() or not s.get("enabled", True) or STATE["subs"].get(key) is not s
-                or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")):
+                or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")
+                or key in STATE.get("batch_cancel_keys", {})):
             return False
         if key in STATE["workers"] and key not in STATE["schedulers"]:
             return False
@@ -460,7 +463,8 @@ def _start_scheduler_for(key: str, s: dict, acc) -> bool:
                           **sched_params())
         with LOCK:
             if (remote_enabled() or STATE["subs"].get(key) is not s
-                    or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")):
+                    or STATE["accounts"].get(acc.account_id) is not acc or acc.__dict__.get("_retired")
+                    or key in STATE.get("batch_cancel_keys", {})):
                 return False
             if key in STATE["schedulers"]:      # 竞态兜底：别起第二个
                 s["orphan"] = False
@@ -2077,6 +2081,37 @@ def api_batch_enroll():
     return _batch_response("批量报名", results)
 
 
+@contextlib.contextmanager
+def _quiesce_subscription(key: str):
+    """Coordinate with any active/exiting scheduler action for `key` during cancellation."""
+    with LOCK:
+        holds = STATE.setdefault("batch_cancel_keys", {})
+        holds[key] = holds.get(key, 0) + 1
+        candidates = []
+        for candidate in (STATE["schedulers"].get(key),
+                          getattr(STATE["workers"].get(key), "_scheduler", None)):
+            if candidate is not None and all(candidate is not existing for existing in candidates):
+                candidates.append(candidate)
+    stack = contextlib.ExitStack()
+    try:
+        for sched in candidates:
+            quiesce = getattr(sched, "quiesce", None)
+            if callable(quiesce):
+                cm = quiesce()
+                if hasattr(type(cm), "__enter__") and hasattr(type(cm), "__exit__"):
+                    stack.enter_context(cm)
+        yield candidates
+    finally:
+        stack.close()
+        with LOCK:
+            holds = STATE.get("batch_cancel_keys")
+            if holds and key in holds:
+                if holds[key] <= 1:
+                    holds.pop(key, None)
+                else:
+                    holds[key] -= 1
+
+
 @app.post("/api/batch_cancel")
 def api_batch_cancel():
     """批量取消报名 / 取消预约：仅对「已报名」「已预约」执行取消并做快速复核。"""
@@ -2094,65 +2129,72 @@ def api_batch_cancel():
             continue
         c = SveClient(acc)
         for tid in tids:
-            try:
-                it = c.detail(tid)
-            except SveError as e:
-                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                "result": "fail", "reason": str(e)})
-                continue
-            own = it.get("zh_user_status")
-            nm = it.get("name") or tid
-            # 规则 A：仅官方状态为「已报名」「已预约」才执行取消；其余状态一律 skip。
-            if own not in ("已报名", "已预约"):
-                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                "name": nm, "result": "skip",
-                                "reason": "未报名或不可取消（%s）" % (own or "未知状态")})
-                continue
-            try:
-                c.cancel(tid)
-            except SveError as e:
-                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                                "name": nm, "result": "fail", "reason": str(e)})
-                continue
-            ok2, why, after = False, "", None
-            try:
-                it2 = c.detail(tid)
-                after = it2.get("zh_user_status")
-                if after in ("已报名", "已预约"):
-                    time.sleep(0.5)
+            key = sub_key(aid, tid)
+            with _quiesce_subscription(key) as sched_candidates:
+                try:
+                    it = c.detail(tid)
+                except SveError as e:
+                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                    "result": "fail", "reason": str(e)})
+                    continue
+                own = it.get("zh_user_status")
+                nm = it.get("name") or tid
+                # 规则 A：仅官方状态为「已报名」「已预约」才执行取消；其余状态一律 skip。
+                if own not in ("已报名", "已预约"):
+                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                    "name": nm, "result": "skip",
+                                    "reason": "未报名或不可取消（%s）" % (own or "未知状态")})
+                    continue
+                try:
+                    c.cancel(tid)
+                except SveError as e:
+                    results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                    "name": nm, "result": "fail", "reason": str(e)})
+                    continue
+                ok2, why, after = False, "", None
+                try:
                     it2 = c.detail(tid)
                     after = it2.get("zh_user_status")
-                ok2 = after not in ("已报名", "已预约")
-                if not ok2:
-                    why = "提交后复核状态仍为 %r" % after
-            except SveError as e:
-                why = "提交后复核失败：%s" % e
-            results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
-                            "name": nm, "result": "ok" if ok2 else "fail",
-                            "reason": "" if ok2 else why})
-            if ok2:
-                # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
-                key = sub_key(aid, tid)
-                sched, sub = None, None
-                with LOCK:
-                    dirty = False
-                    if key in STATE["schedulers"] or key in STATE["subs"]:
-                        sched = STATE["schedulers"].pop(key, None)
-                        sub = STATE["subs"].pop(key, None)
-                        dirty = True
-                    rec = STATE["records"].get(key)
-                    if rec is not None:
-                        rec["status"] = after or "已取消"
-                        rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        rec["checked_at"] = time.time()
-                        dirty = True
-                    if dirty:
-                        persist_dataset()
-                if sched:
-                    sched.stop()
-                if sub or sched:
-                    log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
-            log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
+                    if after in ("已报名", "已预约"):
+                        time.sleep(0.5)
+                        it2 = c.detail(tid)
+                        after = it2.get("zh_user_status")
+                    ok2 = after not in ("已报名", "已预约")
+                    if not ok2:
+                        why = "提交后复核状态仍为 %r" % after
+                except SveError as e:
+                    why = "提交后复核失败：%s" % e
+                results.append({"account_id": aid, "account": account_label(aid), "tournament_id": tid,
+                                "name": nm, "result": "ok" if ok2 else "fail",
+                                "reason": "" if ok2 else why})
+                if ok2:
+                    # 规则 B：仅在取消复核确认成功后联动清理同键残留订阅并更新本地报名记录。
+                    stopped = []
+                    sub = None
+                    with LOCK:
+                        dirty = False
+                        if key in STATE["schedulers"] or key in STATE["subs"]:
+                            popped = STATE["schedulers"].pop(key, None)
+                            if popped is not None:
+                                stopped.append(popped)
+                            sub = STATE["subs"].pop(key, None)
+                            dirty = True
+                        for candidate in (getattr(STATE["workers"].get(key), "_scheduler", None), *sched_candidates):
+                            if candidate is not None and all(candidate is not existing for existing in stopped):
+                                stopped.append(candidate)
+                        rec = STATE["records"].get(key)
+                        if rec is not None:
+                            rec["status"] = after or "已取消"
+                            rec["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            rec["checked_at"] = time.time()
+                            dirty = True
+                        if dirty:
+                            persist_dataset()
+                    for sched in stopped:
+                        sched.stop()
+                    if sub or stopped:
+                        log("批量取消联动清理订阅：%s（%s）@ %s" % (nm, tid, aid))
+                log("批量取消：%s → %s（%s）" % (aid, nm, "成功" if ok2 else "复核未通过"))
 
     return _batch_response("批量取消", results)
 
@@ -2555,6 +2597,9 @@ def api_subscribe():
                             "error": "旧订阅线程尚未退出，请稍后重试"})
         if key in STATE["workers"] and key not in STATE["schedulers"]:
             raise AccountConflict("旧订阅线程尚未退出，暂不重建执行点")
+        if key in STATE.get("batch_cancel_keys", {}):
+            return jsonify({"ok": False, "code": "subscription_conflict",
+                            "error": "该赛事正在执行批量取消，请稍后重试"})
         old = STATE["subs"].get(key) or {}
         STATE["subs"][key] = {
             "account_id": acc.account_id, "account": acc.account_id, "uid": acc.uid, "tournament_id": tid,
