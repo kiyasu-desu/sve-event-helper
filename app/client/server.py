@@ -2342,16 +2342,18 @@ def _verify_cancel_outcome(c: SveClient, tid: str, cancel_err, deadline: float, 
     try:
         it2 = c.detail(tid)
         after = it2.get("zh_user_status")
-        if cancel_err is None and after in ("已报名", "已预约"):
+        if after in ("已报名", "已预约"):
             if time.monotonic() < deadline and time.monotonic() < verify_deadline:
                 time.sleep(0.5)
                 if time.monotonic() < verify_deadline:
                     it2 = c.detail(tid)
                     after = it2.get("zh_user_status")
                 else:
-                    return False, "取消后达到请求时限，状态待后台确认", after, True, True
+                    why = str(cancel_err) if cancel_err is not None else "取消后达到请求时限，状态待后台确认"
+                    return False, why, after, True, True
             else:
-                return False, "提交后复核状态仍为 %r" % after, after, True, True
+                why = str(cancel_err) if cancel_err is not None else ("提交后复核状态仍为 %r" % after)
+                return False, why, after, True, True
     except SveError as ver_err:
         if time.monotonic() >= deadline:
             hit_deadline = True
@@ -2360,9 +2362,8 @@ def _verify_cancel_outcome(c: SveClient, tid: str, cancel_err, deadline: float, 
 
     if after not in ("已报名", "已预约"):
         return True, "", after, False, hit_deadline or time.monotonic() >= deadline
-    if cancel_err is not None:
-        return False, str(cancel_err), after, False, hit_deadline or time.monotonic() >= deadline
-    return False, "提交后复核状态仍为 %r" % after, after, False, hit_deadline or time.monotonic() >= deadline
+    why = str(cancel_err) if cancel_err is not None else ("提交后复核状态仍为 %r" % after)
+    return False, why, after, False, hit_deadline or time.monotonic() >= deadline
 
 
 def _spawn_cancel_reconciler(key: str, acc, tid: str, nm: str, lease: _QuiesceLease) -> None:

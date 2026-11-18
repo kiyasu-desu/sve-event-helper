@@ -391,7 +391,8 @@ class BatchCancelTests(unittest.TestCase):
         self.assertEqual(("fail", "提交后复核失败：test-verify-1"), (by_tid["test-v1-err"]["result"], by_tid["test-v1-err"]["reason"]))
         self.assertEqual(("fail", "提交后复核失败：test-verify-2"), (by_tid["test-v2-err"]["result"], by_tid["test-v2-err"]["reason"]))
         self.assertEqual("ok", by_tid["test-good"]["result"])
-        self.sleep.assert_called_once_with(0.5)
+        self.assertEqual(2, self.sleep.call_count)
+        self.sleep.assert_called_with(0.5)
         self.assertEqual(["10001|test-v1-err", "10001|test-v2-err"], [c.args[0] for c in spawn_reconciler.call_args_list])
 
         for failed_tid in ("test-d-err", "test-c-err", "test-v1-err", "test-v2-err"):
@@ -1619,7 +1620,7 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
         }
         state_lock = threading.Lock()
-        server_state = {"status": "已报名"}
+        server_state = {"status": "已报名", "stale_reads_left": 0}
         sample_seen = threading.Event()
         release_sample = threading.Event()
         self.addCleanup(release_sample.set)
@@ -1635,15 +1636,20 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
             if client is sched.client:
                 return {"name": tid, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8}
             with state_lock:
+                if server_state["stale_reads_left"] > 0:
+                    server_state["stale_reads_left"] -= 1
+                    return {"name": tid, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
                 return {"name": tid, "zh_user_status": server_state["status"], "player_num": 1, "max_player_number": 8}
 
-        def cancel_drop_after_apply(client, qtid):
+        def cancel_drop_with_lag(client, qtid):
             with state_lock:
                 server_state["status"] = "可报名"
+                # First post-cancel detail() briefly sees the old status before propagation completes.
+                server_state["stale_reads_left"] = 1
             raise srv.SveError("网络请求失败: timed out")
 
         with patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail), \
-                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel_drop_after_apply), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=cancel_drop_with_lag), \
                 patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not re-signup")):
             thread.start()
             self.assertTrue(sample_seen.wait(timeout=5))
@@ -1657,6 +1663,67 @@ class BatchCancelConcurrencyTests(unittest.TestCase):
         self.assertNotIn(key, srv.STATE["schedulers"])
         self.assertTrue(sched.stop_flag.is_set())
         self.assertEqual("可报名", srv.STATE["records"][key]["status"])
+
+        # Case 2: ambiguous cancel exceeds BATCH_CANCEL_BUDGET while first verify briefly sees 已报名 ->
+        # keeps scheduler quiesced via reconciler until delayed status settles as 可报名.
+        key2, tid2 = "10001|test-ambig-reconcile", "test-ambig-reconcile"
+        srv.STATE["records"][key2] = {
+            "account_id": "10001", "account": "10001", "uid": 10001,
+            "tournament_id": tid2, "name": tid2, "source": "测试",
+            "status": "已报名", "at": "2026-01-01 00:00:00",
+            "updated": "2026-01-01 00:00:00", "checked_at": 0.0,
+        }
+        server_state2 = {"status": "已报名", "stale_reads_left": 0}
+        sample_seen2 = threading.Event()
+        release_sample2 = threading.Event()
+        self.addCleanup(release_sample2.set)
+
+        def on_event2(kind, data):
+            if kind == "sample":
+                sample_seen2.set()
+                release_sample2.wait(timeout=5)
+
+        sched2, thread2 = self._setup_scheduler(key2, tid2, on_event=on_event2)
+
+        def detail2(client, qtid):
+            if client is sched2.client:
+                return {"name": tid2, "zh_user_status": "可报名", "player_num": 1, "max_player_number": 8}
+            with state_lock:
+                if server_state2["stale_reads_left"] > 0:
+                    server_state2["stale_reads_left"] -= 1
+                    return {"name": tid2, "zh_user_status": "已报名", "player_num": 1, "max_player_number": 8}
+                return {"name": tid2, "zh_user_status": server_state2["status"], "player_num": 1, "max_player_number": 8}
+
+        def slow_ambig_cancel(client, qtid):
+            threading.Event().wait(0.06)
+            with state_lock:
+                server_state2["status"] = "可报名"
+                server_state2["stale_reads_left"] = 1
+            raise srv.SveError("网络请求失败: timed out")
+
+        with patch.object(srv, "BATCH_CANCEL_BUDGET", 0.04), \
+                patch.object(srv, "BATCH_CANCEL_VERIFY_BUDGET", 0.25), \
+                patch.object(srv, "BATCH_CANCEL_RECONCILE_DELAYS", (0.04,)), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=detail2), \
+                patch.object(srv.SveClient, "cancel", autospec=True, side_effect=slow_ambig_cancel), \
+                patch.object(srv.SveClient, "signup", side_effect=AssertionError("Must not re-signup")):
+            thread2.start()
+            self.assertTrue(sample_seen2.wait(timeout=5))
+
+            res2 = self._post("/api/batch_cancel", {"account_ids": ["10001"], "tournaments": [tid2]})
+            self.assertEqual("fail", res2["results"][0]["result"])
+            with sched2._action_cond:
+                self.assertGreater(sched2._action_holds, 0)
+            self.assertIn(key2, srv.STATE["batch_cancel_keys"])
+
+            release_sample2.set()
+            self._wait_for_reconcile_idle()
+            thread2.join(timeout=5)
+
+        self.assertTrue(sched2.stop_flag.is_set())
+        self.assertNotIn(key2, srv.STATE["subs"])
+        self.assertNotIn(key2, srv.STATE["batch_cancel_keys"])
+        self.assertEqual("可报名", srv.STATE["records"][key2]["status"])
 
     def test_uncertain_cancel_verification_holds_quiesce_until_reconciler_resolves(self):
         srv = self.srv
