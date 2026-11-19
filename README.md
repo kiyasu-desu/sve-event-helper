@@ -2,10 +2,9 @@
 
 《影之诗：进化对决》赛事的**通用自动报名系统**。
 
-项目仓库：[sve-event-helper](https://github.com/kiyasu-desu/sve-event-helper)（私有，需 GitHub 登录及访问权限）。应用侧栏入口的发布来源及生产核对见 [M21 部署说明](deploy/README.md#m21-项目仓库入口)。
+公开仓库：[sve-event-helper](https://github.com/kiyasu-desu/sve-event-helper)｜通用签名版 Android 客户端：[GitHub Releases](https://github.com/kiyasu-desu/sve-event-helper/releases)。应用侧栏入口的发布来源及生产核对见 [M21 部署说明](deploy/README.md#m21-项目仓库入口)。
 
-多账号、按地区浏览赛事、订阅后**自动抢位报名**；本机提供 Web 界面，服务器负责实际执行。
-不再局限于某一场大奖赛——任何出现在赛事列表里的比赛都可以订阅。
+多账号、按地区浏览赛事、订阅后**自动抢位报名**；本机或自部署服务端提供 Web/PWA 界面，后台负责实际执行——出现在赛事列表里的比赛都可以订阅与自动报名。
 
 ```
 ┌─────────────────────────── 本机（Windows）───────────────────────────┐
@@ -44,8 +43,7 @@
 **执行位置可切换**：界面「自动报名执行位置」面板决定订阅是**在本机跑**还是**推给服务器跑**。
 两者**只能有一个在跑**（见 §2「唯一执行点」）。
 
-**与早期形态的区别**：项目最初只是"某场大奖赛的名额监控 + 人工报名"。
-现在的核心是**订阅体系 + 全自动报名**：一次订阅，代理按报名窗口自动提速、自动提交、
+系统采用**订阅体系 + 全自动报名**：一次订阅，代理按报名窗口自动提速、自动提交、
 自动复核，成功即通知并移出订阅列表——**全程无需人工**。
 
 ---
@@ -290,6 +288,17 @@ Get-Content capture\poll.log -Tail 20       # 轮询日志
 
 ---
 
+## 自部署与手机接入指南
+
+公开仓库与 GitHub Releases 不包含任何私人服务器地址、认证凭据或通知密钥；自部署与手机端使用流程如下：
+
+1. **部署服务端与签名密钥**：按 [deploy/README.md](deploy/README.md) 在 Linux 部署 `sve-agent`（或本机运行客户端），并自行配置环境变量 `SVE_APP_KEY`（参见 §3，仓库不随包分发）。
+2. **接入 HTTPS 安全访问入口**：使用 Cloudflare Tunnel + Cloudflare Access（详见 [deploy/Android-App.md](deploy/Android-App.md)）或 Tailscale Serve（详见 [deploy/PWA-Tailscale.md](deploy/PWA-Tailscale.md)）暴露 HTTPS 入口；纯手机浏览器/PWA 也可配合 SSH 本地端口转发使用（见 [deploy/PWA-SSH-Tunnel.md](deploy/PWA-SSH-Tunnel.md)）。
+3. **下载通用签名版 Android APK 并配置**：从 [GitHub Releases](https://github.com/kiyasu-desu/sve-event-helper/releases) 下载 `app-release.apk` 安装。该包不内置服务器地址与通知密钥；首次启动会引导填写你或管理员提供的 HTTPS 服务地址（例如 `https://sve.example.com`），后续也可在设置页或长按桌面图标菜单中随时更换。
+4. **登录与通知设置**：进入主界面后，在「设置」中自行配置 PushPlus 或 SMTP 邮件通知，并在账号区点击「新增账号」完成官方页面登录。
+
+---
+
 ## 8. 目录结构
 
 > 每个脚本的职责、状态（核心/工具/已退役/一次性）与约定，
@@ -297,7 +306,7 @@ Get-Content capture\poll.log -Tail 20       # 轮询日志
 > 客户端内部结构见 **[app/client/README.md](app/client/README.md)**。
 
 ```
-sve-monitor/
+sve-event-helper/
 ├─ README.md                      本文件
 ├─ .gitignore                     ★ 排除凭据与运行时数据（见文件内注释）
 ├─ config/
@@ -310,14 +319,15 @@ sve-monitor/
 │  │  ├─ scheduler.py             订阅调度器：分档轮询 + 两段复核
 │  │  ├─ weblogin.py              浏览器登录（Chrome + CDP 读 Cookie）
 │  │  └─ agentlink.py             代理连接 + SSH 隧道（自愈）
-│  ├─ ui/                         index.html / subs.html
+│  ├─ ui/                         index.html / subs.html / sw.js / manifest.json
 │  ├─ data/                       运行时数据（除 areas.json 外均 gitignore）
 │  │  ├─ areas.json               省/市列表（界面需要，必须保留）
 │  │  └─ identity-v2.json            ⚠️ 账号与会话（本地私有）
 │  └─ test_*.py                   完成链路与自动移出的回归测试
-├─ deploy/                        Linux 部署
+├─ android/                       ★ Android WebView 壳（运行时配置 HTTPS 服务地址，支持 Release 签名出包）
+├─ deploy/                        Linux 部署与发布说明
 │  ├─ install.sh / uninstall.sh / verify.sh
-│  ├─ systemd/                    sve-agent / sve-poller / sve-watchdog
+│  ├─ systemd/                    sve-agent / sve-watchdog
 │  └─ README.md                   ★ 部署与排查（含安全说明）
 ├─ scripts/
 │  ├─ README.md                   ★ 脚本索引与约定（先读这个）
@@ -403,14 +413,7 @@ sve-monitor/
 
 ---
 
-## 12. 附：旧轮询器退役
+## 12. 附：旧轮询器退役与外部运行目录
 
-早期单账号单赛事执行链已无条件封锁，不再提供启动、直连报名或会话恢复操作。旧实现仅用于 Git 历史追溯；现役通知、看护与开发签名工具已经迁出该目录。兼容范围、代码包清理和独立生产 unit 维护见 [M20](deploy/M20-retire-legacy-poller.md)。
-
-## 外部运行目录（M05）
-
-服务器可将运行数据、settings、日志和发布备份迁出代码目录。已有部署先阅读 [M05 迁移与回退](deploy/M05-external-runtime.md)，在停写维护窗口用离线工具迁移，再配置受保护的 EnvironmentFile；仅设置 SVE_DATA_DIR 不会自动搬走旧文件。地区数据继续随代码发布，现有手机入口和登录协议保持兼容。
-
-## M20 旧执行链退役
-
-自动报名由 UID 服务订阅调度器执行。通知使用 `app/client/core/notification_sender.py`，代理看护使用 `scripts/runtime/watchdog.py --once`。历史轮询、直连报名、会话恢复及 Windows 轮询控制器已封锁。旧 `scripts/poller/watchdog.py --once --agent` 暂时转发到同一现役模块、状态与写锁。新包排除旧执行器与开发签名工具；部署及回退见 [M20](deploy/M20-retire-legacy-poller.md)。
+- **旧执行链退役（M20）**：早期单账号单赛事执行链已无条件封锁，不再提供启动、直连报名或会话恢复操作。自动报名统一由 UID 服务订阅调度器执行，通知使用 `app/client/core/notification_sender.py`，代理看护使用 `scripts/runtime/watchdog.py --once`（`scripts/poller/watchdog.py --once --agent` 暂作转发）。旧执行器仅保留用于 Git 历史追溯；发布排除范围、兼容细节与独立生产 unit 维护见 [M20](deploy/M20-retire-legacy-poller.md)。
+- **外部运行目录（M05）**：服务器可将运行数据、settings、日志和发布备份迁出代码目录。已有部署先阅读 [M05 迁移与回退](deploy/M05-external-runtime.md)，在停写维护窗口用离线工具迁移，再配置受保护的 `EnvironmentFile`；仅设置 `SVE_DATA_DIR` 不会自动搬走旧文件。地区数据继续随代码发布，现有手机入口和登录协议保持兼容。

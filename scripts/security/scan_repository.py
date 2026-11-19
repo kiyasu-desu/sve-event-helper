@@ -155,7 +155,7 @@ def main() -> int:
             for _, category in findings(name.encode("utf-8"), known):
                 count += 1
                 print(f"{label}{safe_name}:<path>: {category}")
-            if re.search(r"(?:^|/)(?:private\.properties|settings\.json|accounts\.json|subscriptions\.json|records\.json|notify\.json|remote\.json|identity-v2\.json|identity-migration\.json|deployment-state\.json|runtime-migration\.json|watchdog-state\.json|release\.json|secrets\.env|private-scan\.json|signing-samples\.json)$|(?:^|/)(?:identity-backups|deployment-backups|maintenance-backups|legacy-config|\.deployment-backups|\.maintenance)/|\.(?:apk|aab|jks|keystore|pem)$", name):
+            if re.search(r"(?:^|/)(?:private\.properties|keystore\.properties|settings\.json|accounts\.json|subscriptions\.json|records\.json|notify\.json|remote\.json|identity-v2\.json|identity-migration\.json|deployment-state\.json|runtime-migration\.json|watchdog-state\.json|release\.json|secrets\.env|private-scan\.json|signing-samples\.json)$|(?:^|/)(?:identity-backups|deployment-backups|maintenance-backups|legacy-config|\.deployment-backups|\.maintenance)/|\.(?:apk|aab|jks|keystore|pem)$", name):
                 count += 1
                 if any("/" + folder + "/" in "/" + name for folder in ("identity-backups", ".deployment-backups", "deployment-backups", ".maintenance", "maintenance-backups", "legacy-config")):
                     safe_name = "<private-backup-path>"

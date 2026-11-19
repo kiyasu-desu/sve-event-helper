@@ -9,9 +9,6 @@ package com.svetool.monitor
  */
 object Cfg {
 
-    /** 服务器 Web UI（经 Cloudflare Tunnel + Access）。 */
-    const val BASE_URL = BuildConfig.SVE_BASE_URL
-
     /** 官方登录页（与电脑端 weblogin.py 用的是同一个地址）。 */
     const val LOGIN_PAGE = "https://login-betasystem.nie.netease.com/ma68/#/pages/index/index"
 
@@ -45,7 +42,7 @@ object Cfg {
     /**
      * 清理网易域 Cookie 时使用的 URL。
      *
-     * ⚠️ **绝不能包含 [BASE_URL]** —— 我们自己的域上有 Cloudflare Access 的
+     * ⚠️ **绝不能包含用户配置的服务器域名** —— 自家域上有 Cloudflare Access 的
      * `CF_Authorization` JWT，把它清掉会让主界面掉登录，用户得重新过一遍 Access。
      *
      * 为什么需要清理：`CookieManager` 是 **App 级且跨启动持久**的。上一次登录

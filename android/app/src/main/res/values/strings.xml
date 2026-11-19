@@ -11,4 +11,15 @@
     <string name="back">返回</string>
     <string name="login_confirming">已检测到新的登录凭据，正在确认…（若页面还有验证码/滑块，请先完成）</string>
     <string name="login_waiting_new">请在下方页面完成登录（检测到的是上次遗留的旧会话，不会使用）</string>
+    <string name="login_no_server">尚未配置服务器地址，请先返回设置服务器</string>
+    <string name="server_setup_title">配置服务器地址</string>
+    <string name="server_setup_hint">请输入你或管理员提供的 HTTPS 服务地址 (例如 https://sve.example.com )</string>
+    <string name="server_setup_placeholder">https://sve.example.com</string>
+    <string name="server_setup_save">保存并进入</string>
+    <string name="server_setup_cancel">取消</string>
+    <string name="server_error_title">无法连接到服务器</string>
+    <string name="server_error_detail">无法连接当前服务器，请检查网络或服务器地址</string>
+    <string name="server_error_retry">重试</string>
+    <string name="server_error_change">更换服务器地址</string>
+    <string name="shortcut_switch_server">更换服务器</string>
 </resources>

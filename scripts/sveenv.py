@@ -23,7 +23,7 @@ import shutil
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # ------------------------------------------------------------------ 模拟器实例
-#   sve  -> 16384  监控用（大奖赛报名监控跑在这个实例上）
+#   sve  -> 16384  监控用（主账号测试/调试实例）
 #   sve2 -> 16448  第二账号：验证登录流程，不影响 sve 的会话
 #   pjsk -> 16416  其它用途，本项目不要碰
 SVE_SERIAL = os.environ.get("SVE_SVE_SERIAL", "127.0.0.1:16384")
