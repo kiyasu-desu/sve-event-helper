@@ -36,10 +36,32 @@ class ServerUrlValidatorTest {
 
     @Test
     fun `rejects placeholder example dot com domains`() {
-        for (raw in listOf("https://sve.example.com", "https://example.com", "https://SVE.EXAMPLE.COM/")) {
+        for (raw in listOf(
+            "https://sve.example.com",
+            "https://example.com",
+            "https://SVE.EXAMPLE.COM/",
+            "https://sve.example.com.",
+            "https://example.com."
+        )) {
             val result = ServerUrlValidator.validateAndNormalize(raw)
             assertTrue("Expected Invalid for '$raw'", result is ServerUrlValidator.ValidationResult.Invalid)
         }
+    }
+
+    @Test
+    fun `strips trailing dot from valid host and preserves tracked base url across recreation`() {
+        assertEquals(
+            ServerUrlValidator.ValidationResult.Valid("${https}${validHost}"),
+            ServerUrlValidator.validateAndNormalize("${https}${validHost}./")
+        )
+        assertEquals(
+            "${https}server-a.example.org",
+            ServerConfig.restoreTrackedBaseUrl("${https}server-a.example.org", "${https}server-b.example.org")
+        )
+        assertEquals(
+            "${https}server-b.example.org",
+            ServerConfig.restoreTrackedBaseUrl(null, "${https}server-b.example.org")
+        )
     }
 
     @Test

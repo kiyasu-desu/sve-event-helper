@@ -24,17 +24,20 @@ class ServerSetupActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_ALLOW_CANCEL = "allow_cancel"
+        const val EXTRA_RETURN_RESULT = "return_result"
     }
 
     private lateinit var input: EditText
     private lateinit var errorText: TextView
     private var allowCancel: Boolean = false
+    private var returnResult: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val currentUrl = ServerConfig.getBaseUrl(this)
         allowCancel = intent.getBooleanExtra(EXTRA_ALLOW_CANCEL, currentUrl.isNotEmpty())
+        returnResult = intent.getBooleanExtra(EXTRA_RETURN_RESULT, allowCancel)
 
         val dp = { v: Int ->
             TypedValue.applyDimension(
@@ -194,7 +197,7 @@ class ServerSetupActivity : AppCompatActivity() {
             }
             is ServerUrlValidator.ValidationResult.Valid -> {
                 errorText.visibility = View.GONE
-                if (allowCancel) {
+                if (returnResult) {
                     setResult(RESULT_OK)
                     finish()
                 } else {

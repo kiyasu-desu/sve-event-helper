@@ -36,11 +36,14 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         const val ACTION_SWITCH_SERVER = "com.svetool.monitor.ACTION_SWITCH_SERVER"
+        private const val STATE_BASE_URL = "state_base_url"
+        private const val STATE_PENDING_HISTORY_CLEAR = "state_pending_history_clear"
     }
 
     private lateinit var web: WebView
     private lateinit var errorOverlay: View
     private var currentBaseUrl: String = ""
+    private var pendingHistoryClear: Boolean = false
 
     private val loginLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -62,8 +65,8 @@ class MainActivity : AppCompatActivity() {
             hideErrorOverlay()
             if (updated != currentBaseUrl) {
                 currentBaseUrl = updated
+                pendingHistoryClear = true
                 web.stopLoading()
-                web.clearHistory()
                 web.loadUrl(updated)
             } else {
                 web.reload()
@@ -85,7 +88,11 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
-        currentBaseUrl = initialUrl
+        currentBaseUrl = ServerConfig.restoreTrackedBaseUrl(
+            savedInstanceState?.getString(STATE_BASE_URL),
+            initialUrl
+        )
+        pendingHistoryClear = savedInstanceState?.getBoolean(STATE_PENDING_HISTORY_CLEAR, false) ?: false
 
         val root = FrameLayout(this)
         web = WebView(this)
@@ -142,6 +149,13 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 hideErrorOverlay()
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                if (pendingHistoryClear) {
+                    pendingHistoryClear = false
+                    view.clearHistory()
+                }
             }
 
             override fun onReceivedError(
@@ -210,10 +224,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun launchServerSetup(allowCancel: Boolean) {
+    private fun launchServerSetup(allowCancel: Boolean, returnResult: Boolean = true) {
         setupLauncher.launch(
             Intent(this, ServerSetupActivity::class.java)
                 .putExtra(ServerSetupActivity.EXTRA_ALLOW_CANCEL, allowCancel)
+                .putExtra(ServerSetupActivity.EXTRA_RETURN_RESULT, returnResult)
         )
     }
 
@@ -337,6 +352,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        outState.putString(STATE_BASE_URL, currentBaseUrl)
+        outState.putBoolean(STATE_PENDING_HISTORY_CLEAR, pendingHistoryClear)
         if (::web.isInitialized) {
             web.saveState(outState)
         }

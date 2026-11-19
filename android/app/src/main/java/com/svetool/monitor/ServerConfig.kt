@@ -45,4 +45,9 @@ object ServerConfig {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().remove(KEY_BASE_URL).commit()
     }
+
+    internal fun restoreTrackedBaseUrl(savedUrl: String?, configuredUrl: String): String {
+        val saved = savedUrl.orEmpty().trim()
+        return saved.ifEmpty { configuredUrl }
+    }
 }

@@ -37,7 +37,7 @@ object ServerUrlValidator {
             return ValidationResult.Invalid("服务器端口号无效")
         }
 
-        val host = uri.host?.trim()?.lowercase()
+        val host = uri.host?.trim()?.trimEnd('.')?.lowercase()
         if (host.isNullOrEmpty()) {
             return ValidationResult.Invalid("请输入有效的服务器域名或地址")
         }

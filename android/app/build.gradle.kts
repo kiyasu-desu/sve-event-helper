@@ -28,12 +28,13 @@ val debugBaseUrl = if (usePrivateUrl) {
     val candidate = (System.getenv("SVE_BASE_URL")
         ?: privateConfig.getProperty("sve.baseUrl") ?: "").trim()
     val uri = runCatching { URI(candidate) }.getOrNull()
+    val host = uri?.host?.trimEnd('.')?.lowercase().orEmpty()
     require(
-        uri != null && uri.scheme == "https" &&
-            !uri.host.isNullOrBlank() && uri.rawUserInfo == null &&
+        uri != null && uri.scheme?.lowercase() == "https" &&
+            host.isNotBlank() && uri.rawUserInfo == null &&
             uri.rawQuery == null && uri.rawFragment == null &&
             (uri.rawPath.isNullOrEmpty() || uri.rawPath == "/") &&
-            uri.host != "example.com" && !uri.host.endsWith(".example.com")
+            host != "example.com" && !host.endsWith(".example.com")
     ) {
         "When -PsveUsePrivateUrl=true is set, set SVE_BASE_URL or android/private.properties sve.baseUrl to your existing HTTPS origin (no credentials/query/path)."
     }
