@@ -22,7 +22,7 @@ import uuid
 
 sys.dont_write_bytecode = True
 
-CORE = ("accountguard", "agentlink", "identity_migration", "identity_store", "notification_config", "releaseinfo", "scheduler_health", "watchdog_state", "runtime_paths", "scheduler", "sveapi", "weblogin")
+CORE = ("accountguard", "agentlink", "auth_context", "identity_migration", "identity_store", "notification_config", "releaseinfo", "scheduler_health", "user_store", "watchdog_state", "runtime_paths", "scheduler", "sveapi", "weblogin")
 FILES = (
     "README.md", "config/secrets.env.example", "config/settings.example.json", "app/client/server.py", "app/client/data/areas.json",
     *("app/client/core/%s.py" % name for name in CORE),
@@ -38,7 +38,8 @@ M05_ADDITIONS = {"app/client/core/runtime_paths.py", "config/secrets.env.example
                  "deploy/runtime_migrate.py", "deploy/M05-external-runtime.md"}
 M06_ADDITIONS = {"app/client/core/notification_config.py", "app/client/core/scheduler_health.py",
                  "app/client/core/watchdog_state.py", "deploy/M06-scheduler-watchdog.md"}
-M06_FILES = set(FILES)
+M24_ADDITIONS = {"app/client/core/auth_context.py", "app/client/core/user_store.py"}
+M06_FILES = set(FILES) - M24_ADDITIONS
 M05_FILES = M06_FILES - M06_ADDITIONS
 LEGACY_FILES = M05_FILES - M05_ADDITIONS
 RETIRED_FILES = tuple("scripts/poller/%s.py" % name for name in
@@ -47,6 +48,7 @@ FILES = tuple(name for name in FILES if name not in RETIRED_FILES) + (
     "app/client/core/notification_sender.py", "scripts/runtime/watchdog.py",
     "deploy/M20-retire-legacy-poller.md",
 )
+M20_FILES = set(FILES) - M24_ADDITIONS
 # Only these fixed code paths may be removed/restored. Runtime data is never swept.
 SWITCH_FILES = tuple(dict.fromkeys((*FILES, *RETIRED_FILES)))
 
@@ -179,7 +181,7 @@ def verify_package(root, installed=False):
             or not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_sha", ""))
             or not re.fullmatch(r"sve-[0-9a-f]{12}-[0-9TZ]+", manifest.get("release_id", ""))
             or not isinstance(manifest.get("built_at"), str)
-            or not isinstance(manifest.get("files"), dict) or set(manifest["files"]) not in (set(FILES), M06_FILES, M05_FILES, LEGACY_FILES)):
+            or not isinstance(manifest.get("files"), dict) or set(manifest["files"]) not in (set(FILES), M20_FILES, M06_FILES, M05_FILES, LEGACY_FILES)):
         raise ValueError("Invalid manifest contract")
     if not manifest["release_id"].startswith("sve-" + manifest["source_sha"][:12] + "-"):
         raise ValueError("Release ID/source mismatch")

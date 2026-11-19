@@ -57,6 +57,9 @@ from accountguard import (AccountConflict, normalized_uid, revision, check_ident
 from identity_store import (IdentityStore, WriterLock, PublicationUncertain,
                             resolve as resolve_value, empty_state)  # noqa: E402
 from releaseinfo import snapshot as release_snapshot  # noqa: E402
+from auth_context import (AuthError, UserContext, CloudflareAccessVerifier,  # noqa: E402
+                          resolve_request_user, has_proxy_headers)
+from user_store import UserStore, USER_DOC  # noqa: E402
 
 RELEASE_AT_START = release_snapshot(REPO_ROOT)
 PROCESS_STARTED_AT = time.time()
@@ -97,6 +100,10 @@ def _no_cache(resp):
         # Do not leave an old intent attached to a later native-FAB login. A lost
         # response leaves the client's original cookie intact for receipt replay.
         resp.delete_cookie("sve_login_intent")
+    if getattr(g, "replace_account_cookie", None):
+        resp.set_cookie("sve_account_id", g.replace_account_cookie, httponly=True, samesite="Lax")
+    elif getattr(g, "clear_stale_account_cookie", False):
+        resp.delete_cookie("sve_account_id")
     return resp
 
 # ------------------------------------------------------------------ 状态
@@ -114,6 +121,7 @@ STATE = {
     # 记录只是线索，真实状态由 refresh_records() 定期回查服务端确认。
     "records": {},           # sub_key -> {account, uid, tournament_id, name, source, at, status, ...}
     "login": {"running": False, "message": "", "ok": False, "error": ""},
+    "login_by_user": {},
     # 远端执行模式：订阅与调度交给服务器上的代理，本机只做交互。
     # remote = {"enabled": bool, "host","user","key","ssh_port","local_port","remote_port"}
     "remote": {"enabled": False},
@@ -125,7 +133,81 @@ STATE = {
 ACCOUNTS_LOADED_OK = False
 LOCK = threading.RLock()
 STORE = None
+USER_STORE = None
+_USER_STORE_DIR = None
+CF_VERIFIER = None
+_CF_VERIFIER_CONFIG = None
 REMOTE_LOCK = threading.Lock()  # Lock order: REMOTE_LOCK, then LOCK; never the reverse.
+
+
+def _auth_mode(env=None) -> str:
+    environ = os.environ if env is None else env
+    return str(environ.get("SVE_AUTH_MODE") or "single").strip().lower()
+
+
+def get_cf_verifier(env=None) -> CloudflareAccessVerifier | None:
+    global CF_VERIFIER, _CF_VERIFIER_CONFIG
+    environ = os.environ if env is None else env
+    if _auth_mode(environ) != "cloudflare":
+        return None
+    team = str(environ.get("SVE_CF_ACCESS_TEAM") or "").strip()
+    aud = str(environ.get("SVE_CF_ACCESS_AUD") or "").strip()
+    cfg = (team, aud)
+    if CF_VERIFIER is None or _CF_VERIFIER_CONFIG != cfg:
+        if not team or not aud:
+            return None
+        CF_VERIFIER = CloudflareAccessVerifier(team, aud)
+        _CF_VERIFIER_CONFIG = cfg
+    return CF_VERIFIER
+
+
+def current_user() -> UserContext:
+    if has_request_context():
+        cached = getattr(g, "sve_user", None)
+        if cached is not None:
+            return cached
+        return resolve_request_user(request.headers, request.remote_addr, os.environ, get_cf_verifier())
+    return UserContext(user_id="owner", role="admin", email=None, authenticated=True)
+
+
+def require_admin() -> UserContext:
+    u = current_user()
+    if u.role != "admin":
+        raise AuthError("forbidden", "仅管理员可执行此操作", 403)
+    return u
+
+
+def _ensure_user_state_locked(*, persist_init: bool = False) -> tuple[UserStore, dict]:
+    global USER_STORE, _USER_STORE_DIR
+    target_dir = os.path.abspath(DATA_DIR)
+    if USER_STORE is None or _USER_STORE_DIR != target_dir:
+        USER_STORE = UserStore(DATA_DIR)
+        _USER_STORE_DIR = target_dir
+        STATE.pop("users", None)
+    users_doc = STATE.get("users")
+    if not isinstance(users_doc, dict):
+        users_doc = USER_STORE.load(
+            initial_accounts=list(STATE["accounts"].keys()),
+            initial_active=STATE.get("active"),
+            persist_if_missing=persist_init,
+        )
+        STATE["users"] = users_doc
+    bound_anywhere = set()
+    for entry in users_doc.get("users", {}).values():
+        bound_anywhere.update(entry.get("bound_account_ids", ()))
+    owner_entry = USER_STORE.ensure_user(users_doc, "owner", "admin")
+    owner_history = owner_entry.get("unbound_history", {})
+    for aid in STATE["accounts"]:
+        if aid not in bound_anywhere and aid not in owner_history:
+            owner_entry["bound_account_ids"].append(aid)
+    if owner_entry.get("active_account_id") not in owner_entry["bound_account_ids"]:
+        active = STATE.get("active")
+        owner_entry["active_account_id"] = (
+            active
+            if active in owner_entry["bound_account_ids"]
+            else (owner_entry["bound_account_ids"][0] if owner_entry["bound_account_ids"] else None)
+        )
+    return USER_STORE, users_doc
 
 
 def remote_operation(func):
@@ -383,7 +465,7 @@ def save_json(path: str, obj) -> None:
     # 数据目录里的文件含会话凭据，落盘即收紧权限。
     # 必须在这里做：早先只在安装脚本里 chmod 过一次，结果账号同步重写文件后
     # 权限被打回 umask 默认的 644（verify.sh 第 4 节就是这么抓到的）。
-    if os.path.dirname(os.path.abspath(path)) == os.path.abspath(DATA_DIR):
+    if Path(os.path.abspath(path)).is_relative_to(Path(os.path.abspath(DATA_DIR))):
         try:
             os.chmod(tmp, 0o600)
         except OSError:
@@ -403,7 +485,7 @@ def load_json(path: str, default):
 
 @remote_operation
 def load_all() -> None:
-    global ACCOUNTS_LOADED_OK, STORE
+    global ACCOUNTS_LOADED_OK, STORE, USER_STORE, _USER_STORE_DIR
     STORE = IdentityStore(DATA_DIR)
     STORE._require_writer()
     data = STORE.load(initialize=True)
@@ -413,6 +495,10 @@ def load_all() -> None:
     STATE["records"] = data["records"]
     for field in ("pending", "tombstones", "operations"):
         STATE[field] = data[field]
+    USER_STORE = None
+    _USER_STORE_DIR = None
+    STATE.pop("users", None)
+    _ensure_user_state_locked(persist_init=True)
     ACCOUNTS_LOADED_OK = True
     # 远端执行模式：上次是开着的就自动恢复（含重建隧道），
     # 否则重启客户端后会悄悄退回本地执行，变成两处都可能有调度器。
@@ -689,6 +775,8 @@ def remote_config_view(cfg=None):
 
 @app.post("/api/notify/config")
 def api_notify_save():
+    uid = current_user().user_id
+    nfile = notify_file_for_user(uid)
     body = request.json or {}
     incoming = body.get("channels", {})
     if not isinstance(incoming, dict) or any(name not in NOTIFY_FIELDS or not isinstance(row, dict) for name, row in incoming.items()):
@@ -696,10 +784,11 @@ def api_notify_save():
     errors = {}
     try:
         with LOCK:
-            cur = copy.deepcopy(settings_json(NOTIFY_FILE, {}))
+            cur = copy.deepcopy(settings_json(nfile, {}))
+            src = notify_sources(uid)
             for channel, fields in incoming.items():
                 for field, val in fields.items():
-                    if field not in NOTIFY_FIELDS[channel] or notify_sources().get(channel + "." + field) == "env":
+                    if field not in NOTIFY_FIELDS[channel] or src.get(channel + "." + field) == "env":
                         continue
                     if val is None or (isinstance(val, str) and not val.strip()):
                         continue
@@ -727,8 +816,11 @@ def api_notify_save():
                 for channel, field in SECRET_FIELDS:
                     if channel in cur:
                         cur[channel].pop(field, None)
-            effective = read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE,
-                lambda path, default: cur if str(path) == str(NOTIFY_FILE) else settings_json(path, default))
+            if uid == "owner":
+                effective = read_notify_channels(AGENT_SETTINGS, nfile,
+                    lambda path, default: cur if str(path) == str(nfile) else settings_json(path, default))
+            else:
+                effective = cur
             required = {"pushplus": ("token",), "email": ("smtp_host", "username", "authcode", "to_addrs")}
             for channel, fields in required.items():
                 row = effective.get(channel, {})
@@ -746,8 +838,17 @@ def api_notify_save():
                         errors["email.smtp_port"] = "端口须为 1 至 65535 的整数"
             if errors:
                 return jsonify(settings_failure("validation_failed", "请检查标记的通知字段", errors))
-            save_json(NOTIFY_FILE, cur)
-        return jsonify({"ok": True, **notify_config_view()})
+            if uid != "owner":
+                parent = Path(nfile).parent
+                parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if os.name != "nt":
+                    for folder in (parent.parent, parent):
+                        try:
+                            os.chmod(folder, 0o700)
+                        except OSError:
+                            pass
+            save_json(nfile, cur)
+        return jsonify({"ok": True, **notify_config_view(uid)})
     except Exception:
         return jsonify(settings_failure("settings_write_failed", "通知配置保存失败，请检查配置与存储"))
 
@@ -755,15 +856,17 @@ def api_notify_save():
 @app.post("/api/notify/test")
 def api_notify_test():
     """发一条测试通知，用来验证凭据真的可用（而不是"填了就算配好"）。"""
-    ch = notify_channels()
+    uid = current_user().user_id
+    ch = notify_channels(uid)
     if not ch:
         return jsonify({"ok": False, "error": "还没有任何通知渠道配置"})
     title = "【SVE】通知测试"
+    source_label = (STATE.get("active") if uid == "owner" else None) or "自动报名代理"
     html = ("<h3>通知通道自检</h3>"
             "<p><b>来源：</b>%s</p>"
             "<p><b>时间：</b>%s</p>"
             "<p>看到这条说明配置可用。</p>"
-            % (STATE.get("active") or "自动报名代理",
+            % (source_label,
                time.strftime("%Y-%m-%d %H:%M:%S")))
     results = []
     try:
@@ -780,6 +883,7 @@ def api_notify_test():
 
 @app.get("/api/remote/status")
 def api_remote_status():
+    require_admin()
     try:
         info = {"ok": True, "config": remote_config_view(),
                 "tunnel": {"running": bool(STATE.get("tunnel") and STATE["tunnel"].running)}}
@@ -791,6 +895,7 @@ def api_remote_status():
 
 @app.post("/api/remote/config")
 def api_remote_config():
+    require_admin()
     try:
         return configure_remote()
     except AccountConflict:
@@ -929,14 +1034,77 @@ def compare_remote_accounts() -> dict:
             "note": "服务器维护成员集合；本机缓存仅供登录，不自动同步或恢复账号。"}
 
 
+def visible_account_ids(user_id: str | None = None) -> set[str]:
+    uid = current_user().user_id if user_id is None else user_id
+    with LOCK:
+        if uid == "owner" and _auth_mode() != "cloudflare":
+            return set(STATE["accounts"].keys())
+        store, users_doc = _ensure_user_state_locked()
+        return set(store.bound_accounts(users_doc, uid)) & set(STATE["accounts"].keys())
+
+
+def user_known_history_ids(user_id: str | None = None) -> set[str]:
+    uid = current_user().user_id if user_id is None else user_id
+    with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        history = set(store.unbound_history(users_doc, uid).keys())
+        if uid == "owner":
+            if _auth_mode() != "cloudflare":
+                return history | set(STATE["tombstones"].keys())
+            other_known = set()
+            for k, entry in (users_doc.get("users") or {}).items():
+                if k != "owner":
+                    other_known.update(entry.get("bound_account_ids", ()))
+                    other_known.update(entry.get("unbound_history", {}).keys())
+            for aid in STATE["tombstones"]:
+                if aid in history or aid not in other_known:
+                    history.add(aid)
+        return history
+
+
+def authorize_account(aid: str, user_id: str | None = None, *, allow_history: bool = False) -> None:
+    uid = current_user().user_id if user_id is None else user_id
+    with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        if uid == "owner" and _auth_mode() != "cloudflare":
+            if aid in STATE["accounts"] or (allow_history and aid in STATE["tombstones"]):
+                return
+            return
+        visible = set(store.bound_accounts(users_doc, uid)) & set(STATE["accounts"].keys())
+        if aid in visible:
+            return
+        if allow_history and aid in user_known_history_ids(uid):
+            return
+        other_bound = False
+        for k, entry in (users_doc.get("users") or {}).items():
+            if k != uid and (aid in entry.get("bound_account_ids", ()) or aid in entry.get("unbound_history", {})):
+                other_bound = True
+                break
+        role = (users_doc.get("users", {}).get(uid) or {}).get("role") or current_user().role
+        if role != "admin" or aid in STATE["accounts"] or other_bound:
+            raise AuthError("forbidden", "无权操作该游戏账号", 403)
+
+
 def identity_accounts():
     if remote_enabled():
+        require_admin()
         link = agent()
         summary = link.accounts_summary()
         rows = read_account_summary(link, summary=summary)
         g.identity_tombstones = summary.get("tombstones", {})
         return {row["account_id"]: Account.from_dict(row) for row in rows}
-    return STATE["accounts"]
+    visible = visible_account_ids()
+    return {aid: acc for aid, acc in STATE["accounts"].items() if aid in visible}
+
+
+def _user_default_account(uid: str, accounts: dict) -> str | None:
+    if uid == "owner":
+        default = STATE["active"]
+    else:
+        with LOCK:
+            store, users_doc = _ensure_user_state_locked()
+            default = store.get_active_account(users_doc, uid)
+    return default if default in accounts else next(iter(accounts), None)
 
 
 def resolve(accounts, selector, *, explicit=False, expected_uid=None):
@@ -963,16 +1131,50 @@ def request_account(body=None, *, allow_default=False):
         raise AccountConflict("请求缺少账号 ID，请刷新并明确选择账号")
     accounts = identity_accounts()
     if "account_id" in body:
+        if not remote_enabled() and body["account_id"] not in (None, ""):
+            authorize_account(normalized_uid(body["account_id"]))
         return resolve(accounts, body["account_id"], explicit=True, expected_uid=body.get("expected_uid"))
     if "account" in body or "name" in body:
-        return resolve(accounts, body.get("account", body.get("name")), expected_uid=body.get("expected_uid"))
+        raw_sel = body.get("account", body.get("name"))
+        if not remote_enabled() and isinstance(raw_sel, str) and raw_sel.strip():
+            try:
+                cand_uid = normalized_uid(raw_sel)
+            except AccountConflict:
+                cand_uid = None
+            if cand_uid and cand_uid in STATE["accounts"] and cand_uid not in accounts:
+                authorize_account(cand_uid)
+        return resolve(accounts, raw_sel, expected_uid=body.get("expected_uid"))
+    uid = current_user().user_id
     if selected:
-        if allow_default and selected not in accounts:
-            return STATE["active"] if STATE["active"] in accounts else next(iter(accounts), None)
+        if selected not in accounts:
+            if allow_default:
+                fallback = _user_default_account(uid, accounts)
+                if has_request_context():
+                    if fallback:
+                        g.replace_account_cookie = fallback
+                    else:
+                        g.clear_stale_account_cookie = True
+                return fallback
+            if not remote_enabled():
+                with LOCK:
+                    store, users_doc = _ensure_user_state_locked()
+                    other_bound = any(
+                        k != uid and (selected in entry.get("bound_account_ids", ()) or selected in entry.get("unbound_history", {}))
+                        for k, entry in (users_doc.get("users") or {}).items()
+                    )
+                if other_bound and selected not in user_known_history_ids(uid):
+                    fallback = _user_default_account(uid, accounts)
+                    if fallback:
+                        if has_request_context():
+                            g.replace_account_cookie = fallback
+                        return fallback
+                    if has_request_context():
+                        g.clear_stale_account_cookie = True
+        if not remote_enabled():
+            authorize_account(normalized_uid(selected))
         return resolve(accounts, selected, explicit=True)
     if allow_default:
-        default = STATE["active"]
-        return default if default in accounts else next(iter(accounts), None)
+        return _user_default_account(uid, accounts)
     raise AccountConflict("请求缺少账号 ID，请刷新并明确选择账号")
 
 
@@ -987,6 +1189,7 @@ def check_subscription_identity(body, account):
 
 @remote_operation
 def forward_subscription(tid, account, *, cancel=False):
+    require_admin()
     if not remote_enabled():
         raise AccountConflict("执行模式已变化")
     ready_login_tunnel()
@@ -1015,6 +1218,7 @@ def refresh_remote_accounts() -> None:
 @app.post("/api/remote/push_accounts")
 def api_remote_push_accounts():
     """Old UI button remains compatible but is now strictly read-only."""
+    require_admin()
     try:
         return jsonify(compare_remote_accounts())
     except AccountConflict:
@@ -1045,13 +1249,17 @@ def operation_result(operation_id, fingerprint):
     return None
 
 
-def commit_login(acc: Account, *, expected_revision, select=False, operation_id, fingerprint, restore=False, binding=None):
+def commit_login(acc: Account, *, expected_revision, select=False, operation_id, fingerprint, restore=False, binding=None, bind_user_id: str | None = None, bind_user_role: str | None = None):
     global ACCOUNTS_LOADED_OK
     parse_account(acc.to_dict(), Account)
     aid = acc.account_id
+    u = current_user()
+    uid = bind_user_id or u.user_id
+    role = bind_user_role or ("admin" if uid == "owner" else u.role)
     with LOCK:
         if not ACCOUNTS_LOADED_OK:
             raise AccountConflict("身份数据集未成功载入，保留原件并拒绝写入")
+        store, users_doc = _ensure_user_state_locked()
         previous = operation_result(operation_id, fingerprint)
         if previous:
             return previous
@@ -1074,9 +1282,27 @@ def commit_login(acc: Account, *, expected_revision, select=False, operation_id,
         tombstones = dict(STATE["tombstones"])
         tombstones.pop(aid, None)
         operations = dict(STATE["operations"])
-        operations[operation_id] = {"kind": "session", "fingerprint": fingerprint, "result": result, "binding": binding}
-        active = aid if select else (STATE["active"] or aid)
-        persist_dataset(accounts=accounts, active_account_id=active, tombstones=tombstones, operations=operations)
+        operations[operation_id] = {"kind": "session", "fingerprint": fingerprint, "result": result, "binding": binding, "user_id": uid}
+        if uid == "owner":
+            active = aid if select else (STATE["active"] or aid)
+        else:
+            active = STATE["active"]
+        next_users_doc = copy.deepcopy(users_doc)
+        login_label = "%s (UID %s)" % (acc.nickname or acc.name, aid)
+        store.bind_account(next_users_doc, uid, role, aid, select=bool(select), label=login_label)
+        if uid != "owner" or _auth_mode() == "cloudflare" or store.path.exists():
+            store.save(next_users_doc)
+        try:
+            persist_dataset(accounts=accounts, active_account_id=active, tombstones=tombstones, operations=operations)
+        except Exception:
+            if uid != "owner" or _auth_mode() == "cloudflare" or store.path.exists():
+                try:
+                    store.save(users_doc)
+                except Exception:
+                    pass
+            raise
+        users_doc.clear()
+        users_doc.update(next_users_doc)
         if current:
             with current.credential_lock:
                 current.__dict__.update({key: value for key, value in acc.to_dict().items() if key != "account_id"})
@@ -1098,6 +1324,9 @@ def save_explicit_login(acc: Account, observed: dict):
     aid = acc.account_id
     acc.name = acc.nickname or ("uid%s" % aid)
     parse_account(acc.to_dict(), Account)
+    uid = observed.get("user_id") or current_user().user_id
+    role = observed.get("user_role") or current_user().role
+    user_bound = observed.get("user_bound_accounts")
     local = observed["accounts"]
     restore = observed.get("restore_account_id") == aid
     if observed.get("restore_account_id") and not restore:
@@ -1107,6 +1336,12 @@ def save_explicit_login(acc: Account, observed: dict):
         if STATE["remote"] != observed["remote"]:
             raise AccountConflict("执行配置已变化，请重新登录；本次未提交服务器")
         current = STATE["accounts"].get(aid)
+        if current is not None and user_bound is not None and aid not in user_bound:
+            local_expected = revision(current)
+            restore = False
+        elif current is None and aid in STATE["tombstones"] and not restore and uid != "owner" and aid not in user_known_history_ids(uid):
+            restore = True
+            local_expected = STATE["tombstones"][aid]["version"]
         local_version = revision(current) if current else (STATE["tombstones"].get(aid, {}).get("version", 0) if restore else 0)
         if local_version != local_expected:
             raise AccountConflict("本机身份已变化，请重新登录")
@@ -1122,7 +1357,8 @@ def save_explicit_login(acc: Account, observed: dict):
     return commit_login(acc, expected_revision=local_expected, select=not remote_enabled(),
                         operation_id=observed["operation_id"],
                         fingerprint=operation_fingerprint("login", acc.to_dict()), restore=restore,
-                        binding=observed.get("cookie_binding"))
+                        binding=observed.get("cookie_binding"),
+                        bind_user_id=uid, bind_user_role=role)
 
 
 def ready_login_tunnel():
@@ -1136,8 +1372,12 @@ def ready_login_tunnel():
 @remote_operation
 def login_snapshot() -> dict:
     """Capture both sides before acquiring a new session; never refresh its CAS token."""
+    u = current_user()
     with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        user_bound = set(store.bound_accounts(users_doc, u.user_id)) & set(STATE["accounts"].keys())
         snapshot = {"accounts": {name: revision(acc) for name, acc in STATE["accounts"].items()},
+                    "user_id": u.user_id, "user_role": u.role, "user_bound_accounts": set(user_bound),
                     "remote": dict(STATE["remote"]), "operation_id": uuid.uuid4().hex,
                     "tombstones": copy.deepcopy(STATE["tombstones"])}
         link = agent() if remote_enabled() else None
@@ -1169,25 +1409,48 @@ AGENT_SETTINGS = str(RUNTIME.settings)
 from notification_config import ENV_NOTIFY, SECRET_FIELDS, channels as read_notify_channels
 
 
-def notify_channels() -> dict:
-    """解析通知渠道配置，三层优先级：
+def notify_file_for_user(user_id: str | None = None) -> str:
+    uid = current_user().user_id if user_id is None else user_id
+    if uid == "owner":
+        return NOTIFY_FILE
+    with LOCK:
+        store, _ = _ensure_user_state_locked()
+        return str(store.notify_file_for(uid))
 
-        环境变量  >  <DATA_DIR>/notify.json（界面写入）  >  RUNTIME.settings
 
-    未迁移时保留旧配置；外部模式只读外部 settings，不回退到代码目录。
+def notify_channels(user_id: str | None = None, loader=load_json) -> dict:
+    """解析通知渠道配置：
+
+    - owner (管理员)：环境变量 > <DATA_DIR>/notify.json > RUNTIME.settings
+    - 普通用户：仅 <DATA_DIR>/users/<user_key>/notify.json，绝不继承管理员 ENV_NOTIFY 或 settings.json
     """
-    return read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, load_json)
+    uid = current_user().user_id if user_id is None else user_id
+    if uid == "owner":
+        return read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, loader)
+    nfile = notify_file_for_user(uid)
+    ui = loader(nfile, {}) or {}
+    if not isinstance(ui, dict):
+        raise ValueError("invalid settings object")
+    merged = {}
+    for name in NOTIFY_FIELDS:
+        if isinstance(ui.get(name), dict):
+            merged[name] = dict(ui[name])
+    return merged
 
 
-def notify_sources() -> dict:
+def notify_sources(user_id: str | None = None) -> dict:
+    uid = current_user().user_id if user_id is None else user_id
+    if uid != "owner":
+        return {}
     return {"%s.%s" % (channel, field): "env"
             for (channel, field), name in ENV_NOTIFY.items() if os.environ.get(name)}
 
 
-def notify_config_view() -> dict:
+def notify_config_view(user_id: str | None = None) -> dict:
     """No personal configuration values or credential fragments reach the page."""
-    cfg = read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, settings_json)
-    src = notify_sources()
+    uid = current_user().user_id if user_id is None else user_id
+    cfg = notify_channels(uid, loader=settings_json)
+    src = notify_sources(uid)
     out = {}
     for channel, fields in NOTIFY_FIELDS.items():
         current = cfg.get(channel, {})
@@ -1203,11 +1466,33 @@ def notify_config_view() -> dict:
     return {"channels": out}
 
 
-def send_notify(title: str, html: str) -> None:
+def is_notify_configured(user_id: str | None = None) -> bool:
+    uid = current_user().user_id if user_id is None else user_id
+    try:
+        cfg = notify_channels(uid, loader=settings_json)
+    except Exception:
+        return False
+    pp = cfg.get("pushplus") if isinstance(cfg.get("pushplus"), dict) else {}
+    if pp.get("enabled") and str(pp.get("token") or "").strip():
+        return True
+    em = cfg.get("email") if isinstance(cfg.get("email"), dict) else {}
+    if (
+        em.get("enabled")
+        and str(em.get("smtp_host") or "").strip()
+        and str(em.get("username") or "").strip()
+        and str(em.get("authcode") or "").strip()
+        and em.get("to_addrs")
+    ):
+        return True
+    return False
+
+
+def send_notify(title: str, html: str, *, user_id: str | None = None) -> None:
     """发送通知。复用 core/notification_sender.py 的实现（PushPlus + 邮件 + 重试）。"""
-    ch = notify_channels()
-    if not ch:
-        log("未找到通知配置（%s），跳过通知" % AGENT_SETTINGS)
+    target_user = "owner" if user_id is None else user_id
+    ch = notify_channels(target_user)
+    if not ch or (target_user != "owner" and not any(isinstance(v, dict) and v.get("enabled") for v in ch.values())):
+        log("未找到通知配置（%s），跳过通知" % (AGENT_SETTINGS if target_user == "owner" else "user"))
         return
     try:
         import notification_sender as _n
@@ -1216,6 +1501,19 @@ def send_notify(title: str, html: str) -> None:
             log("通知[%s] %s %s" % (name, "成功" if ok else "失败", detail))
     except Exception as e:
         log("通知发送异常: %s" % e)
+
+
+def notify_for_account(account_id: str | None, title: str, html: str) -> None:
+    """Send account-scoped notifications to every platform user currently binding `account_id`."""
+    with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        holders = store.users_for_account(users_doc, account_id) if account_id else []
+    targets = holders or ["owner"]
+    for uid in targets:
+        if uid == "owner":
+            send_notify(title, html)
+        else:
+            send_notify(title, html, user_id=uid)
 
 
 def notify_completed(s: dict, already: bool) -> None:
@@ -1232,7 +1530,11 @@ def notify_completed(s: dict, already: bool) -> None:
            "订阅启动时该账号已是「已报名」，无需重复提交" if already
            else "已提交报名，并经过「立即复核 + 静默二次确认」两段校验")
     )
-    send_notify("【SVE】自动报名成功 - %s" % (s.get("name") or s.get("tournament_id")), html)
+    notify_for_account(
+        s.get("account_id"),
+        "【SVE】自动报名成功 - %s" % (s.get("name") or s.get("tournament_id")),
+        html,
+    )
 
 
 def notify_time_conflict(s: dict, reason: str, code=None, detail: str = "") -> None:
@@ -1259,11 +1561,14 @@ def notify_time_conflict(s: dict, reason: str, code=None, detail: str = "") -> N
         % (s.get("name"), s.get("tournament_id"), who, reason,
            code or "（服务端未提供）", time.strftime("%Y-%m-%d %H:%M:%S"))
     )
-    send_notify("【SVE】订阅已取消（时间冲突）- %s"
-                % (s.get("name") or s.get("tournament_id")), html)
+    notify_for_account(
+        s.get("account_id"),
+        "【SVE】订阅已取消（时间冲突）- %s" % (s.get("name") or s.get("tournament_id")),
+        html,
+    )
 
 
-def notify_account_purged(account: str, dropped: list, *, reason: str = "") -> None:
+def notify_account_purged(account: str, dropped: list, *, reason: str = "", user_id: str | None = None) -> None:
     """账号被移除、其订阅被自动清理时的通知。
 
     用户明确要求"删账号要通知"——订阅凭空消失会让人以为是自己点的。
@@ -1290,7 +1595,11 @@ def notify_account_purged(account: str, dropped: list, *, reason: str = "") -> N
         % (escape_html(account), reason or "账号已被删除", len(dropped), items,
            time.strftime("%Y-%m-%d %H:%M:%S"))
     )
-    send_notify("【SVE】账号已移除，%d 条订阅已清理 - %s" % (len(dropped), account), html)
+    title = "【SVE】账号已移除，%d 条订阅已清理 - %s" % (len(dropped), account)
+    if user_id and user_id != "owner":
+        send_notify(title, html, user_id=user_id)
+    else:
+        send_notify(title, html)
 
 
 def _record_epoch_locked(key: str) -> int:
@@ -1333,8 +1642,9 @@ def add_record(account: str, uid, tid, name: str, source: str,
         persist_records()
 
 
-def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
+def refresh_records(max_age: float = RECORD_TTL, account_id=None, account_ids=None) -> None:
     """后台回查每条已报名记录的真实状态（同一时刻只跑一个）。"""
+    allowed_set = set(account_ids) if account_ids is not None else None
     with LOCK:
         if RECORDS_REFRESHING["flag"]:
             return
@@ -1343,6 +1653,7 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
         stale = [(k, dict(v), epochs.get(k, 0)) for k, v in STATE["records"].items()
                  if k not in cancelling
                  and (account_id is None or v["account_id"] == account_id)
+                 and (allowed_set is None or v["account_id"] in allowed_set)
                  and v["account_id"] in STATE["accounts"]
                  and time.time() - float(v.get("checked_at") or 0) > max_age]
         RECORDS_REFRESHING["flag"] = True
@@ -1387,6 +1698,11 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
                 RECORDS_REFRESHING["flag"] = False
 
     threading.Thread(target=worker, daemon=True, name="rec-refresh").start()
+
+
+@app.errorhandler(AuthError)
+def auth_error_handler(error: AuthError):
+    return jsonify({"ok": False, "code": error.code, "error": error.message}), error.status_code
 
 
 @app.errorhandler(AccountConflict)
@@ -1479,6 +1795,8 @@ def api_scheduler_health():
     # Local watchdog protocol; no nicknames, logs, sessions or upstream requests.
     if request.remote_addr not in {"127.0.0.1", "::1"}:
         return jsonify({"ok": False, "code": "loopback_required"}), 403
+    if has_proxy_headers(request.headers):
+        require_admin()
     if not LOCK.acquire(timeout=0.2):
         return jsonify({"ok": False, "code": "state_busy"}), 503
     try:
@@ -1546,7 +1864,7 @@ def proxy_identity_request():
             (params if request.method == "GET" else body)["account_id"] = aid
     result = agent().endpoint(request.method, request.path, body if request.method != "GET" else None, params)
     if request.path == "/api/state" and result.get("ok") is not False:
-        result["login"] = STATE["login"]
+        result["login"] = _login_view_for_user()
         result["can_login"] = login_capability()["can_login"]
     if request.path == "/api/state":
         result["remote"] = dict(remote_config_view(), agent_ok=result.get("ok") is not False)
@@ -1558,25 +1876,62 @@ def proxy_identity_request():
 
 @app.before_request
 def proxy_data_routes():
+    if (
+        request.path == "/api/scheduler/health"
+        and request.remote_addr in {"127.0.0.1", "::1"}
+        and not has_proxy_headers(request.headers)
+    ):
+        g.sve_user = UserContext(user_id="owner", role="admin", email=None, authenticated=True)
+    else:
+        user = resolve_request_user(request.headers, request.remote_addr, os.environ, get_cf_verifier())
+        g.sve_user = user
+        with LOCK:
+            store, users_doc = _ensure_user_state_locked()
+            is_new = user.user_id not in users_doc.get("users", {})
+            old_role = (users_doc.get("users", {}).get(user.user_id) or {}).get("role")
+            store.ensure_user(users_doc, user.user_id, user.role)
+            if (is_new or old_role != user.role) and (_auth_mode() == "cloudflare" or store.path.exists()):
+                store.save(users_doc)
     if STATE["storage_failed"] and request.path.startswith("/api/") and request.path != "/api/scheduler/health":
         return jsonify({"ok": False, "code": "storage_unavailable", "error": "身份存储待核对，执行已暂停；检查存储后重启读取，不覆盖数据快照"})
     if request.method == "POST" and request.content_length and not isinstance(request.get_json(silent=True), dict):
         raise AccountConflict("JSON 请求必须是对象；未执行任何账号操作")
-    if remote_enabled() and request.path in PROXY_ROUTES:
+    if remote_enabled() and current_user().role == "admin" and request.path in PROXY_ROUTES:
         return proxy_identity_request()
+
+
+def _login_view_for_user(user_id: str | None = None) -> dict:
+    uid = current_user().user_id if user_id is None else user_id
+    default_view = {"running": False, "message": "", "ok": False, "error": ""}
+    by_user = STATE.get("login_by_user") or {}
+    if uid in by_user and isinstance(by_user[uid], dict):
+        view = {k: v for k, v in by_user[uid].items() if k != "user_id"}
+        return {**default_view, **view}
+    raw = STATE.get("login")
+    if isinstance(raw, dict):
+        owner = raw.get("user_id", "owner")
+        if owner == uid:
+            view = {k: v for k, v in raw.items() if k != "user_id"}
+            return {**default_view, **view}
+    return default_view
 
 
 @app.get("/api/state")
 def api_state():
+    u = current_user()
     selected = request_account(allow_default=True)
+    visible = visible_account_ids(u.user_id)
     with LOCK:
+        store, users_doc = _ensure_user_state_locked()
         accs = [{"account_id": aid, "name": a.name, "uid": a.uid, "nickname": a.nickname,
                  "label": account_label(aid), "version": a.version, "active": aid == selected,
                  **profile_status(a)}
-                for aid, a in STATE["accounts"].items()]
+                for aid, a in STATE["accounts"].items() if aid in visible]
         grouped = {}
         for key, row in STATE["subs"].items():
             aid = row["account_id"]
+            if aid not in visible:
+                continue
             sched = STATE["schedulers"].get(key)
             output = {field: row.get(field) for field in ("name", "uid", "status", "player_num", "max", "enabled", "tournament_id")}
             output.update(key=key, account_id=aid, account=account_label(aid),
@@ -1586,44 +1941,76 @@ def api_state():
                                        and sched and not sched.completed and not sched.stop_flag.is_set()),
                           logs=row.get("logs", [])[-60:])
             grouped.setdefault(aid, []).append(output)
+        all_subs = [row for rows in grouped.values() for row in rows]
+        history_ids = user_known_history_ids(u.user_id) - visible
+        ordered_history = list(dict.fromkeys(
+            [*STATE["tombstones"].keys(), *store.unbound_history(users_doc, u.user_id).keys()]
+        ))
+        deleted_accounts = []
+        for aid in ordered_history:
+            if aid not in history_ids:
+                continue
+            if aid in STATE["tombstones"]:
+                ver = STATE["tombstones"][aid]["version"]
+            elif aid in STATE["accounts"]:
+                ver = STATE["accounts"][aid].version
+            else:
+                continue
+            deleted_accounts.append({"account_id": aid, "version": ver, "label": account_label(aid)})
+        remote_view = remote_config_view() if u.role == "admin" else {"enabled": False, "restricted": True, "fields": {}}
         return jsonify({"ok": True, "schema_version": 2, "active_account_id": selected,
                         "active": account_label(selected) if selected else None, "accounts": accs,
-                        "subs_grouped": grouped, "subs": [row for rows in grouped.values() for row in rows],
-                        "mine": [row["tournament_id"] for row in STATE["subs"].values() if row["account_id"] == selected],
-                        "sub_count": len(STATE["subs"]), "pending_count": len(STATE["pending"]),
-                        "deleted_accounts": [{"account_id": aid, "version": row["version"], "label": account_label(aid)} for aid, row in STATE["tombstones"].items()],
+                        "subs_grouped": grouped, "subs": all_subs,
+                        "mine": [row["tournament_id"] for row in STATE["subs"].values() if row["account_id"] == selected and selected in visible],
+                        "sub_count": len(all_subs), "pending_count": len(STATE["pending"]) if u.role == "admin" else 0,
+                        "deleted_accounts": deleted_accounts,
                         "can_login": login_capability()["can_login"], "login_browser": login_capability()["browser"],
-                        "login": STATE["login"], "log": [], "remote": remote_config_view()})
+                        "login": _login_view_for_user(u.user_id), "log": [], "remote": remote_view,
+                        "user": {"role": u.role, "notify_configured": is_notify_configured(u.user_id)}})
 
 
 def observed_login():
+    u = current_user()
     token = request.cookies.get("sve_login_intent")
     if token:
         with LOCK:
             intent = STATE["login_intents"].get(token)
             if intent is None or time.monotonic() - intent["created"] > 1800:
                 raise AccountConflict("登录意图已过期或服务已重启，请从界面重新发起登录")
+            if intent.get("user_id", "owner") != u.user_id:
+                raise AccountConflict("登录意图与当前登录用户不匹配，请重新发起登录")
             return dict(intent["snapshot"])
     return login_snapshot()
 
 
 @app.post("/api/login/intent")
 def api_login_intent():
+    u = current_user()
     body = request.get_json(silent=True) or {}
     snapshot = login_snapshot()
     if body.get("restore_account_id") is not None:
         aid = normalized_uid(body["restore_account_id"])
         tombstones = snapshot.get("remote_tombstones", {}) if snapshot["remote"].get("enabled") else snapshot["tombstones"]
-        if aid not in tombstones or type(body.get("expected_version")) is not int or body["expected_version"] != tombstones[aid]["version"]:
+        expected_ver = body.get("expected_version")
+        if aid in tombstones and type(expected_ver) is int and expected_ver == tombstones[aid]["version"]:
+            snapshot["restore_account_id"] = aid
+        elif (
+            not snapshot["remote"].get("enabled")
+            and aid in snapshot["accounts"]
+            and aid in user_known_history_ids(u.user_id)
+            and type(expected_ver) is int
+            and expected_ver == snapshot["accounts"][aid]
+        ):
+            snapshot["restore_account_id"] = aid
+        else:
             raise AccountConflict("恢复版本已变化，请刷新后明确恢复指定 UID")
-        snapshot["restore_account_id"] = aid
     token = snapshot["operation_id"]
     with LOCK:
         now = time.monotonic()
         STATE["login_intents"] = {key: item for key, item in STATE["login_intents"].items() if now - item["created"] <= 1800}
         if len(STATE["login_intents"]) >= 100:
             raise AccountConflict("登录流程过多，请稍后重试")
-        STATE["login_intents"][token] = {"snapshot": snapshot, "created": now}
+        STATE["login_intents"][token] = {"snapshot": snapshot, "created": now, "user_id": u.user_id}
     response = jsonify({"ok": True})
     response.set_cookie("sve_login_intent", token, httponly=True, samesite="Lax")
     return response
@@ -1646,32 +2033,42 @@ def api_login_start():
         observed = observed_login()
     except AccountConflict as e:
         return jsonify({"ok": False, "error": str(e)})
+    caller_uid = observed.get("user_id") or current_user().user_id
+
+    def _set_login_state(payload: dict) -> None:
+        entry = dict(payload, user_id=caller_uid)
+        STATE["login"] = entry
+        STATE.setdefault("login_by_user", {})[caller_uid] = dict(entry)
+
+    def _update_login_msg(msg: str) -> None:
+        STATE["login"]["message"] = msg
+        STATE.setdefault("login_by_user", {}).setdefault(caller_uid, dict(STATE["login"]))["message"] = msg
 
     def worker():
-        STATE["login"] = {"running": True, "message": "正在打开登录窗口…", "ok": False, "error": ""}
+        _set_login_state({"running": True, "message": "正在打开登录窗口…", "ok": False, "error": ""})
         try:
             with LoginWindow(port=9210) as w:
-                STATE["login"]["message"] = "请在弹出的窗口中完成登录（移动端页面）"
+                _update_login_msg("请在弹出的窗口中完成登录（移动端页面）")
                 log("登录窗口已打开，等待登录…")
                 acc = w.wait_for_login(
                     timeout=900,
-                    on_status=lambda m: STATE["login"].__setitem__("message", m))
+                    on_status=_update_login_msg)
             save_explicit_login(acc, observed)
-            STATE["login"] = {"running": False, "ok": True,
+            _set_login_state({"running": False, "ok": True,
                               "message": "登录成功: %s (uid=%s)" % (acc.nickname, acc.uid),
-                              "error": ""}
+                              "error": ""})
             log("登录成功: %s uid=%s" % (acc.nickname, acc.uid))
             if not remote_enabled():
                 restore_missing_schedulers("登录成功")
         except LoginWindowClosed:
             # 用户自己关了窗口，属于正常操作，不算错误；关键是**立刻结束流程**，
             # 否则 running 一直为真，会卡住后续的登录尝试。
-            STATE["login"] = {"running": False, "ok": False, "message": "",
-                              "error": "", "notice": "登录窗口已关闭，已取消本次登录。可再次点击登录。"}
+            _set_login_state({"running": False, "ok": False, "message": "",
+                              "error": "", "notice": "登录窗口已关闭，已取消本次登录。可再次点击登录。"})
             log("登录窗口被关闭，本次登录已取消")
         except Exception as e:
-            STATE["login"] = {"running": False, "ok": False,
-                              "message": "", "error": str(e)}
+            _set_login_state({"running": False, "ok": False,
+                              "message": "", "error": str(e)})
             log("登录失败: %s" % e)
             log(traceback.format_exc()[-600:])
 
@@ -1681,7 +2078,7 @@ def api_login_start():
 
 @app.get("/api/login/status")
 def api_login_status():
-    return jsonify(STATE["login"])
+    return jsonify(_login_view_for_user())
 
 
 @app.post("/api/login/cookie")
@@ -1790,6 +2187,13 @@ def api_login_cookie():
 @app.post("/api/account/select")
 def api_account_select():
     aid = request_account()
+    u = current_user()
+    if not remote_enabled() and (u.user_id != "owner" or _auth_mode() == "cloudflare"):
+        with LOCK:
+            store, users_doc = _ensure_user_state_locked()
+            store.set_active_account(users_doc, u.user_id, aid)
+            if u.user_id != "owner" or _auth_mode() == "cloudflare" or store.path.exists():
+                store.save(users_doc)
     response = jsonify({"ok": True, "account_id": aid})
     response.set_cookie("sve_account_id", aid, httponly=True, samesite="Lax")
     return response
@@ -1797,6 +2201,7 @@ def api_account_select():
 
 @app.post("/api/account/forget")
 def api_account_forget():
+    u = current_user()
     body = request.get_json(silent=True) or {}
     aid = normalized_uid(body["account_id"]) if "account_id" in body else request_account(body)
     if "expected_uid" in body and normalized_uid(body["expected_uid"]) != aid:
@@ -1804,41 +2209,107 @@ def api_account_forget():
     expected = body.get("expected_version")
     opid = body.get("operation_id")
     fingerprint = operation_fingerprint("delete", body)
+    dropped = []
     with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        prior_receipt = STATE["operations"].get(opid) if isinstance(opid, str) else None
+        if prior_receipt and prior_receipt.get("user_id", "owner") == u.user_id:
+            prior = operation_result(opid, fingerprint)
+            if prior:
+                return jsonify(prior)
+        authorize_account(aid, u.user_id)
         prior = operation_result(opid, fingerprint)
         if prior:
             return jsonify(prior)
         account = STATE["accounts"].get(aid)
         if account is None or type(expected) is not int or expected != account.version:
             raise AccountConflict("删除版本已变化，请刷新后明确删除")
-        # Retire the account under its request lock. Already submitted requests cannot
-        # be recalled; no later request can start on a deleted account object.
-        with account.credential_lock:
-            dropped = [dict(row, key=key, tid=row["tournament_id"])
-                       for key, row in STATE["subs"].items() if row["account_id"] == aid]
-            accounts = {key: value.to_dict() for key, value in STATE["accounts"].items() if key != aid}
-            subs = {key: value for key, value in STATE["subs"].items() if value["account_id"] != aid}
-            tombstones = dict(STATE["tombstones"])
-            tombstones[aid] = {"version": account.version + 1, "nickname": account.nickname,
-                               "legacy_names": sorted(set(account.legacy_names + [account.name])),
-                               "session_version": account.session_version, "profile_version": account.profile_version}
-            result = {"ok": True, "account_id": aid, "version": account.version + 1}
+        label = account_label(aid)
+        holders = store.users_for_account(users_doc, aid)
+        other_holders = [h for h in holders if h != u.user_id]
+        if other_holders:
+            result = {
+                "ok": True,
+                "account_id": aid,
+                "version": account.version,
+                "unbound": True,
+                "shared_remaining": True,
+            }
             operations = dict(STATE["operations"])
-            operations[opid] = {"kind": "delete", "fingerprint": fingerprint, "result": result}
-            active = STATE["active"] if STATE["active"] != aid else next(iter(accounts), None)
-            persist_dataset(accounts=accounts, subscriptions=subs, tombstones=tombstones,
-                            operations=operations, active_account_id=active)
-            account._retired = True
-            for key, row in list(STATE["subs"].items()):
-                if row["account_id"] == aid:
-                    sched = STATE["schedulers"].pop(key, None)
-                    if sched:
-                        sched.stop()
-            STATE["accounts"].pop(aid)
-            STATE.update(subs=subs, tombstones=tombstones, operations=operations, active=active)
+            operations[opid] = {"kind": "delete", "fingerprint": fingerprint, "result": result, "user_id": u.user_id}
+            owner_remaining = [k for k in store.bound_accounts(users_doc, "owner") if k != aid and k in STATE["accounts"]]
+            active = STATE["active"]
+            if u.user_id == "owner" and active == aid:
+                active = owner_remaining[0] if owner_remaining else next(iter(STATE["accounts"]), None)
+            next_users_doc = copy.deepcopy(users_doc)
+            store.unbind_account(next_users_doc, u.user_id, aid, label=label)
+            if u.user_id != "owner" or _auth_mode() == "cloudflare" or store.path.exists() or other_holders:
+                store.save(next_users_doc)
+            try:
+                persist_dataset(operations=operations, active_account_id=active)
+            except Exception:
+                if u.user_id != "owner" or _auth_mode() == "cloudflare" or store.path.exists() or other_holders:
+                    try:
+                        store.save(users_doc)
+                    except Exception:
+                        pass
+                raise
+            users_doc.clear()
+            users_doc.update(next_users_doc)
+            STATE.update(operations=operations, active=active)
+        else:
+            # Retire the account under its request lock. Already submitted requests cannot
+            # be recalled; no later request can start on a deleted account object.
+            with account.credential_lock:
+                dropped = [dict(row, key=key, tid=row["tournament_id"])
+                           for key, row in STATE["subs"].items() if row["account_id"] == aid]
+                accounts = {key: value.to_dict() for key, value in STATE["accounts"].items() if key != aid}
+                subs = {key: value for key, value in STATE["subs"].items() if value["account_id"] != aid}
+                tombstones = dict(STATE["tombstones"])
+                tombstones[aid] = {"version": account.version + 1, "nickname": account.nickname,
+                                   "legacy_names": sorted(set(account.legacy_names + [account.name])),
+                                   "session_version": account.session_version, "profile_version": account.profile_version}
+                result = {
+                    "ok": True,
+                    "account_id": aid,
+                    "version": account.version + 1,
+                    "unbound": True,
+                    "shared_remaining": False,
+                }
+                operations = dict(STATE["operations"])
+                operations[opid] = {"kind": "delete", "fingerprint": fingerprint, "result": result, "user_id": u.user_id}
+                active = STATE["active"] if STATE["active"] != aid else next(iter(accounts), None)
+                next_users_doc = copy.deepcopy(users_doc)
+                store.unbind_account(next_users_doc, u.user_id, aid, label=label)
+                if u.user_id != "owner" or _auth_mode() == "cloudflare" or store.path.exists():
+                    store.save(next_users_doc)
+                try:
+                    persist_dataset(accounts=accounts, subscriptions=subs, tombstones=tombstones,
+                                    operations=operations, active_account_id=active)
+                except Exception:
+                    if u.user_id != "owner" or _auth_mode() == "cloudflare" or store.path.exists():
+                        try:
+                            store.save(users_doc)
+                        except Exception:
+                            pass
+                    raise
+                users_doc.clear()
+                users_doc.update(next_users_doc)
+                account._retired = True
+                for key, row in list(STATE["subs"].items()):
+                    if row["account_id"] == aid:
+                        sched = STATE["schedulers"].pop(key, None)
+                        if sched:
+                            sched.stop()
+                STATE["accounts"].pop(aid)
+                STATE.update(subs=subs, tombstones=tombstones, operations=operations, active=active)
     if dropped:
-        dispatch_notification(notify_account_purged, account_label(aid), dropped,
-                              reason="已明确按 UID 删除账号")
+        if u.user_id == "owner":
+            dispatch_notification(notify_account_purged, account_label(aid), dropped,
+                                  reason="已明确按 UID 删除账号")
+        else:
+            dispatch_notification(notify_account_purged, account_label(aid), dropped,
+                                  reason="已明确按 UID 删除账号", user_id=u.user_id)
     response = jsonify(result)
     if request.cookies.get("sve_account_id") == aid:
         response.delete_cookie("sve_account_id")
@@ -2020,7 +2491,20 @@ def _parse_batch_request(body: dict):
     selectors = body.get("account_ids", body.get("accounts", []))
     if not isinstance(selectors, list):
         raise AccountConflict("账号列表必须是数组")
-    accts = list(dict.fromkeys(resolve(STATE["accounts"], value, explicit="account_ids" in body)
+    explicit = "account_ids" in body
+    accounts = identity_accounts()
+    if not remote_enabled():
+        for value in selectors:
+            if explicit:
+                authorize_account(normalized_uid(value))
+            elif isinstance(value, str) and value.strip():
+                try:
+                    cand = normalized_uid(value)
+                except AccountConflict:
+                    cand = None
+                if cand and cand in STATE["accounts"] and cand not in accounts:
+                    authorize_account(cand)
+    accts = list(dict.fromkeys(resolve(accounts, value, explicit=explicit)
                                for value in selectors))
     raw_tids = [] if body.get("tournaments") is None else body.get("tournaments")
     if not isinstance(raw_tids, list):
@@ -2614,22 +3098,28 @@ def api_cancel():
 
 @app.get("/api/records")
 def api_records():
+    u = current_user()
+    visible = visible_account_ids(u.user_id)
+    allowed = visible | user_known_history_ids(u.user_id)
     selected = None
     if "account_id" in request.args:
         selected = normalized_uid(request.args["account_id"])
+        authorize_account(selected, u.user_id, allow_history=True)
         if selected not in STATE["accounts"] and selected not in STATE["tombstones"]:
             raise AccountConflict("记录账号 ID 不存在")
     elif any(field in request.args for field in ("account", "name")):
         selected = request_account(request.args)
-    refresh_records(account_id=selected)
+    refresh_records(account_id=selected, account_ids=visible if selected is None else None)
     with LOCK:
         grouped = {}
         for key, record in STATE["records"].items():
             aid = record["account_id"]
+            if aid not in allowed:
+                continue
             if selected is not None and aid != selected:
                 continue
             row = {field: record.get(field) for field in ("tournament_id", "name", "uid", "source", "status", "at", "updated", "checked_at", "player_num", "max")}
-            row.update(key=key, account_id=aid, account=account_label(aid), deleted=aid not in STATE["accounts"])
+            row.update(key=key, account_id=aid, account=account_label(aid), deleted=aid not in STATE["accounts"] or aid not in visible)
             grouped.setdefault(aid, []).append(row)
     return jsonify({"ok": True, "grouped": grouped, "records": [row for rows in grouped.values() for row in rows]})
 
@@ -2641,11 +3131,13 @@ def api_records_scan():
     为什么需要：记录只在"本工具完成报名"时产生，无法反映此前已在 APP 里
     报名/预约的赛事。这个接口回查服务端补齐，让列表反映真实全貌。
     """
+    u = current_user()
     body = request.json or {}
     area = body.get("area") or STATE.get("last_area") or "广东省-广州市"
     added = 0
     scanned = []
-    targets = list(STATE["accounts"].items())
+    visible = visible_account_ids(u.user_id)
+    targets = [(name, acc) for name, acc in STATE["accounts"].items() if name in visible]
     if any(field in body for field in ("account_id", "account", "name")):
         aid = request_account(body)
         targets = [(aid, STATE["accounts"][aid])]
@@ -2664,18 +3156,22 @@ def api_records_scan():
             added += 1
         scanned.append({"account_id": name, "account": account_label(name), "found": len(mine)})
     log("扫描 %s：新增/更新 %d 条已报名记录" % (area, added))
+    allowed = visible | user_known_history_ids(u.user_id)
+    count = sum(1 for r in STATE["records"].values() if r.get("account_id") in allowed)
     return jsonify({"ok": True, "area": area, "added": added, "detail": scanned,
-                    "count": len(STATE["records"])})
+                    "count": count})
 
 
 @app.post("/api/records/forget")
 def api_records_forget():
     """删除一条已报名记录（只删本地记录，不影响服务端报名）。"""
+    u = current_user()
     body = request.json or {}
     if "account_id" in body:
         aid = normalized_uid(body["account_id"])
         if "expected_uid" in body and normalized_uid(body["expected_uid"]) != aid:
             raise AccountConflict("记录的 UID 与账号 ID 不一致")
+        authorize_account(aid, u.user_id, allow_history=aid not in STATE["accounts"])
         if aid not in STATE["accounts"] and aid not in STATE["tombstones"]:
             raise AccountConflict("记录的账号 ID 不存在")
         if body.get("key"):
@@ -2687,7 +3183,14 @@ def api_records_forget():
         key = sub_key(aid, tid)
     elif body.get("key"):
         old_account, tid = split_sub_key(body["key"])
-        aid = resolve(STATE["accounts"], old_account, explicit="account_id" in body) if "account_id" not in body else request_account(body)
+        if not remote_enabled() and isinstance(old_account, str) and old_account.strip():
+            try:
+                cand_uid = normalized_uid(old_account)
+            except AccountConflict:
+                cand_uid = None
+            if cand_uid and cand_uid in STATE["accounts"] and cand_uid not in visible_account_ids(u.user_id):
+                authorize_account(cand_uid, u.user_id, allow_history=False)
+        aid = resolve(identity_accounts(), old_account, explicit="account_id" in body) if "account_id" not in body else request_account(body)
         key = sub_key(aid, tid)
     else:
         key = sub_key(request_account(body), str(body.get("tournament_id") or ""))
@@ -2841,11 +3344,13 @@ def summary_payload():
 
 @app.get("/api/accounts/summary")
 def api_accounts_summary():
+    require_admin()
     return jsonify(agent().accounts_summary() if remote_enabled() else summary_payload())
 
 
 @app.post("/api/accounts/sync")
 def api_accounts_sync():
+    require_admin()
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("accounts"), dict):
         raise AccountConflict("accounts 必须是对象")
@@ -2871,15 +3376,20 @@ def api_accounts_session():
     acc = parse_account(body.get("account"), Account)
     if body["account"].get("account_id") != acc.account_id:
         raise AccountConflict("会话提交必须明确指定 account_id")
+    u = current_user()
     fingerprint = operation_fingerprint("session", {key: value for key, value in body.items() if key != "expected_version"})
+    shared_bind = False
     with LOCK:
         prior = operation_result(body.get("operation_id"), fingerprint)
         if prior:
             return jsonify(prior)
         current = STATE["accounts"].get(acc.account_id)
-        expected = revision(current) if current else STATE["tombstones"].get(acc.account_id, {}).get("version", 0)
-        if body["expected_version"] != expected:
-            raise AccountConflict("会话前置版本已变化")
+        if current is not None and acc.account_id not in visible_account_ids(u.user_id) and body["expected_version"] in (0, revision(current)):
+            shared_bind = True
+        else:
+            expected = revision(current) if current else STATE["tombstones"].get(acc.account_id, {}).get("version", 0)
+            if body["expected_version"] != expected:
+                raise AccountConflict("会话前置版本已变化")
     try:
         info = SveClient(acc).info()
     except Exception:
@@ -2890,9 +3400,12 @@ def api_accounts_session():
     acc.nickname = info.get("nickname") or ""
     acc.name = acc.nickname or ("uid%s" % acc.account_id)
     acc.mobile = info.get("mobile") or ""
-    result = commit_login(acc, expected_revision=body["expected_version"],
+    with LOCK:
+        eff_expected = revision(STATE["accounts"].get(acc.account_id)) if shared_bind else body["expected_version"]
+    result = commit_login(acc, expected_revision=eff_expected,
                           operation_id=body.get("operation_id"), fingerprint=fingerprint,
-                          restore=body.get("restore") is True)
+                          restore=body.get("restore") is True,
+                          bind_user_id=u.user_id, bind_user_role=u.role)
     restore_missing_schedulers("明确 UID 会话提交")
     return jsonify(result)
 
