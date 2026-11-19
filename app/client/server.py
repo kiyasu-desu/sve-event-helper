@@ -57,6 +57,9 @@ from accountguard import (AccountConflict, normalized_uid, revision, check_ident
 from identity_store import (IdentityStore, WriterLock, PublicationUncertain,
                             resolve as resolve_value, empty_state)  # noqa: E402
 from releaseinfo import snapshot as release_snapshot  # noqa: E402
+from auth_context import (AuthError, UserContext, CloudflareAccessVerifier,  # noqa: E402
+                          resolve_request_user, has_proxy_headers)
+from user_store import UserStore, USER_DOC  # noqa: E402
 
 RELEASE_AT_START = release_snapshot(REPO_ROOT)
 PROCESS_STARTED_AT = time.time()
@@ -125,7 +128,81 @@ STATE = {
 ACCOUNTS_LOADED_OK = False
 LOCK = threading.RLock()
 STORE = None
+USER_STORE = None
+_USER_STORE_DIR = None
+CF_VERIFIER = None
+_CF_VERIFIER_CONFIG = None
 REMOTE_LOCK = threading.Lock()  # Lock order: REMOTE_LOCK, then LOCK; never the reverse.
+
+
+def _auth_mode(env=None) -> str:
+    environ = os.environ if env is None else env
+    return str(environ.get("SVE_AUTH_MODE") or "single").strip().lower()
+
+
+def get_cf_verifier(env=None) -> CloudflareAccessVerifier | None:
+    global CF_VERIFIER, _CF_VERIFIER_CONFIG
+    environ = os.environ if env is None else env
+    if _auth_mode(environ) != "cloudflare":
+        return None
+    team = str(environ.get("SVE_CF_ACCESS_TEAM") or "").strip()
+    aud = str(environ.get("SVE_CF_ACCESS_AUD") or "").strip()
+    cfg = (team, aud)
+    if CF_VERIFIER is None or _CF_VERIFIER_CONFIG != cfg:
+        if not team or not aud:
+            return None
+        CF_VERIFIER = CloudflareAccessVerifier(team, aud)
+        _CF_VERIFIER_CONFIG = cfg
+    return CF_VERIFIER
+
+
+def current_user() -> UserContext:
+    if has_request_context():
+        cached = getattr(g, "sve_user", None)
+        if cached is not None:
+            return cached
+        return resolve_request_user(request.headers, request.remote_addr, os.environ, get_cf_verifier())
+    return UserContext(user_id="owner", role="admin", email=None, authenticated=True)
+
+
+def require_admin() -> UserContext:
+    u = current_user()
+    if u.role != "admin":
+        raise AuthError("forbidden", "仅管理员可执行此操作", 403)
+    return u
+
+
+def _ensure_user_state_locked(*, persist_init: bool = False) -> tuple[UserStore, dict]:
+    global USER_STORE, _USER_STORE_DIR
+    target_dir = os.path.abspath(DATA_DIR)
+    if USER_STORE is None or _USER_STORE_DIR != target_dir:
+        USER_STORE = UserStore(DATA_DIR)
+        _USER_STORE_DIR = target_dir
+        STATE.pop("users", None)
+    users_doc = STATE.get("users")
+    if not isinstance(users_doc, dict):
+        users_doc = USER_STORE.load(
+            initial_accounts=list(STATE["accounts"].keys()),
+            initial_active=STATE.get("active"),
+            persist_if_missing=persist_init,
+        )
+        STATE["users"] = users_doc
+    bound_anywhere = set()
+    for entry in users_doc.get("users", {}).values():
+        bound_anywhere.update(entry.get("bound_account_ids", ()))
+    owner_entry = USER_STORE.ensure_user(users_doc, "owner", "admin")
+    owner_history = owner_entry.get("unbound_history", {})
+    for aid in STATE["accounts"]:
+        if aid not in bound_anywhere and aid not in owner_history:
+            owner_entry["bound_account_ids"].append(aid)
+    if owner_entry.get("active_account_id") not in owner_entry["bound_account_ids"]:
+        active = STATE.get("active")
+        owner_entry["active_account_id"] = (
+            active
+            if active in owner_entry["bound_account_ids"]
+            else (owner_entry["bound_account_ids"][0] if owner_entry["bound_account_ids"] else None)
+        )
+    return USER_STORE, users_doc
 
 
 def remote_operation(func):
@@ -383,7 +460,7 @@ def save_json(path: str, obj) -> None:
     # 数据目录里的文件含会话凭据，落盘即收紧权限。
     # 必须在这里做：早先只在安装脚本里 chmod 过一次，结果账号同步重写文件后
     # 权限被打回 umask 默认的 644（verify.sh 第 4 节就是这么抓到的）。
-    if os.path.dirname(os.path.abspath(path)) == os.path.abspath(DATA_DIR):
+    if Path(os.path.abspath(path)).is_relative_to(Path(os.path.abspath(DATA_DIR))):
         try:
             os.chmod(tmp, 0o600)
         except OSError:
@@ -403,7 +480,7 @@ def load_json(path: str, default):
 
 @remote_operation
 def load_all() -> None:
-    global ACCOUNTS_LOADED_OK, STORE
+    global ACCOUNTS_LOADED_OK, STORE, USER_STORE, _USER_STORE_DIR
     STORE = IdentityStore(DATA_DIR)
     STORE._require_writer()
     data = STORE.load(initialize=True)
@@ -413,6 +490,10 @@ def load_all() -> None:
     STATE["records"] = data["records"]
     for field in ("pending", "tombstones", "operations"):
         STATE[field] = data[field]
+    USER_STORE = None
+    _USER_STORE_DIR = None
+    STATE.pop("users", None)
+    _ensure_user_state_locked(persist_init=True)
     ACCOUNTS_LOADED_OK = True
     # 远端执行模式：上次是开着的就自动恢复（含重建隧道），
     # 否则重启客户端后会悄悄退回本地执行，变成两处都可能有调度器。
@@ -689,6 +770,8 @@ def remote_config_view(cfg=None):
 
 @app.post("/api/notify/config")
 def api_notify_save():
+    uid = current_user().user_id
+    nfile = notify_file_for_user(uid)
     body = request.json or {}
     incoming = body.get("channels", {})
     if not isinstance(incoming, dict) or any(name not in NOTIFY_FIELDS or not isinstance(row, dict) for name, row in incoming.items()):
@@ -696,10 +779,11 @@ def api_notify_save():
     errors = {}
     try:
         with LOCK:
-            cur = copy.deepcopy(settings_json(NOTIFY_FILE, {}))
+            cur = copy.deepcopy(settings_json(nfile, {}))
+            src = notify_sources(uid)
             for channel, fields in incoming.items():
                 for field, val in fields.items():
-                    if field not in NOTIFY_FIELDS[channel] or notify_sources().get(channel + "." + field) == "env":
+                    if field not in NOTIFY_FIELDS[channel] or src.get(channel + "." + field) == "env":
                         continue
                     if val is None or (isinstance(val, str) and not val.strip()):
                         continue
@@ -727,8 +811,11 @@ def api_notify_save():
                 for channel, field in SECRET_FIELDS:
                     if channel in cur:
                         cur[channel].pop(field, None)
-            effective = read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE,
-                lambda path, default: cur if str(path) == str(NOTIFY_FILE) else settings_json(path, default))
+            if uid == "owner":
+                effective = read_notify_channels(AGENT_SETTINGS, nfile,
+                    lambda path, default: cur if str(path) == str(nfile) else settings_json(path, default))
+            else:
+                effective = cur
             required = {"pushplus": ("token",), "email": ("smtp_host", "username", "authcode", "to_addrs")}
             for channel, fields in required.items():
                 row = effective.get(channel, {})
@@ -746,8 +833,17 @@ def api_notify_save():
                         errors["email.smtp_port"] = "端口须为 1 至 65535 的整数"
             if errors:
                 return jsonify(settings_failure("validation_failed", "请检查标记的通知字段", errors))
-            save_json(NOTIFY_FILE, cur)
-        return jsonify({"ok": True, **notify_config_view()})
+            if uid != "owner":
+                parent = Path(nfile).parent
+                parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if os.name != "nt":
+                    for folder in (parent.parent, parent):
+                        try:
+                            os.chmod(folder, 0o700)
+                        except OSError:
+                            pass
+            save_json(nfile, cur)
+        return jsonify({"ok": True, **notify_config_view(uid)})
     except Exception:
         return jsonify(settings_failure("settings_write_failed", "通知配置保存失败，请检查配置与存储"))
 
@@ -755,15 +851,17 @@ def api_notify_save():
 @app.post("/api/notify/test")
 def api_notify_test():
     """发一条测试通知，用来验证凭据真的可用（而不是"填了就算配好"）。"""
-    ch = notify_channels()
+    uid = current_user().user_id
+    ch = notify_channels(target_user)
     if not ch:
         return jsonify({"ok": False, "error": "还没有任何通知渠道配置"})
     title = "【SVE】通知测试"
+    source_label = (STATE.get("active") if uid == "owner" else None) or "自动报名代理"
     html = ("<h3>通知通道自检</h3>"
             "<p><b>来源：</b>%s</p>"
             "<p><b>时间：</b>%s</p>"
             "<p>看到这条说明配置可用。</p>"
-            % (STATE.get("active") or "自动报名代理",
+            % (source_label,
                time.strftime("%Y-%m-%d %H:%M:%S")))
     results = []
     try:
@@ -780,6 +878,7 @@ def api_notify_test():
 
 @app.get("/api/remote/status")
 def api_remote_status():
+    require_admin()
     try:
         info = {"ok": True, "config": remote_config_view(),
                 "tunnel": {"running": bool(STATE.get("tunnel") and STATE["tunnel"].running)}}
@@ -791,6 +890,7 @@ def api_remote_status():
 
 @app.post("/api/remote/config")
 def api_remote_config():
+    require_admin()
     try:
         return configure_remote()
     except AccountConflict:
@@ -1015,6 +1115,7 @@ def refresh_remote_accounts() -> None:
 @app.post("/api/remote/push_accounts")
 def api_remote_push_accounts():
     """Old UI button remains compatible but is now strictly read-only."""
+    require_admin()
     try:
         return jsonify(compare_remote_accounts())
     except AccountConflict:
@@ -1169,25 +1270,48 @@ AGENT_SETTINGS = str(RUNTIME.settings)
 from notification_config import ENV_NOTIFY, SECRET_FIELDS, channels as read_notify_channels
 
 
-def notify_channels() -> dict:
-    """解析通知渠道配置，三层优先级：
+def notify_file_for_user(user_id: str | None = None) -> str:
+    uid = current_user().user_id if user_id is None else user_id
+    if uid == "owner":
+        return NOTIFY_FILE
+    with LOCK:
+        store, _ = _ensure_user_state_locked()
+        return str(store.notify_file_for(uid))
 
-        环境变量  >  <DATA_DIR>/notify.json（界面写入）  >  RUNTIME.settings
 
-    未迁移时保留旧配置；外部模式只读外部 settings，不回退到代码目录。
+def notify_channels(user_id: str | None = None, loader=load_json) -> dict:
+    """解析通知渠道配置：
+
+    - owner (管理员)：环境变量 > <DATA_DIR>/notify.json > RUNTIME.settings
+    - 普通用户：仅 <DATA_DIR>/users/<user_key>/notify.json，绝不继承管理员 ENV_NOTIFY 或 settings.json
     """
-    return read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, load_json)
+    uid = current_user().user_id if user_id is None else user_id
+    if uid == "owner":
+        return read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, loader)
+    nfile = notify_file_for_user(uid)
+    ui = loader(nfile, {}) or {}
+    if not isinstance(ui, dict):
+        raise ValueError("invalid settings object")
+    merged = {}
+    for name in NOTIFY_FIELDS:
+        if isinstance(ui.get(name), dict):
+            merged[name] = dict(ui[name])
+    return merged
 
 
-def notify_sources() -> dict:
+def notify_sources(user_id: str | None = None) -> dict:
+    uid = current_user().user_id if user_id is None else user_id
+    if uid != "owner":
+        return {}
     return {"%s.%s" % (channel, field): "env"
             for (channel, field), name in ENV_NOTIFY.items() if os.environ.get(name)}
 
 
-def notify_config_view() -> dict:
+def notify_config_view(user_id: str | None = None) -> dict:
     """No personal configuration values or credential fragments reach the page."""
-    cfg = read_notify_channels(AGENT_SETTINGS, NOTIFY_FILE, settings_json)
-    src = notify_sources()
+    uid = current_user().user_id if user_id is None else user_id
+    cfg = notify_channels(uid, loader=settings_json)
+    src = notify_sources(uid)
     out = {}
     for channel, fields in NOTIFY_FIELDS.items():
         current = cfg.get(channel, {})
@@ -1203,11 +1327,33 @@ def notify_config_view() -> dict:
     return {"channels": out}
 
 
-def send_notify(title: str, html: str) -> None:
+def is_notify_configured(user_id: str | None = None) -> bool:
+    uid = current_user().user_id if user_id is None else user_id
+    try:
+        cfg = notify_channels(uid, loader=settings_json)
+    except Exception:
+        return False
+    pp = cfg.get("pushplus") if isinstance(cfg.get("pushplus"), dict) else {}
+    if pp.get("enabled") and str(pp.get("token") or "").strip():
+        return True
+    em = cfg.get("email") if isinstance(cfg.get("email"), dict) else {}
+    if (
+        em.get("enabled")
+        and str(em.get("smtp_host") or "").strip()
+        and str(em.get("username") or "").strip()
+        and str(em.get("authcode") or "").strip()
+        and em.get("to_addrs")
+    ):
+        return True
+    return False
+
+
+def send_notify(title: str, html: str, *, user_id: str | None = None) -> None:
     """发送通知。复用 core/notification_sender.py 的实现（PushPlus + 邮件 + 重试）。"""
-    ch = notify_channels()
-    if not ch:
-        log("未找到通知配置（%s），跳过通知" % AGENT_SETTINGS)
+    target_user = "owner" if user_id is None else user_id
+    ch = notify_channels(target_user)
+    if not ch or (target_user != "owner" and not any(isinstance(v, dict) and v.get("enabled") for v in ch.values())):
+        log("未找到通知配置（%s），跳过通知" % (AGENT_SETTINGS if target_user == "owner" else "user"))
         return
     try:
         import notification_sender as _n
@@ -1216,6 +1362,19 @@ def send_notify(title: str, html: str) -> None:
             log("通知[%s] %s %s" % (name, "成功" if ok else "失败", detail))
     except Exception as e:
         log("通知发送异常: %s" % e)
+
+
+def notify_for_account(account_id: str | None, title: str, html: str) -> None:
+    """Send account-scoped notifications to every platform user currently binding `account_id`."""
+    with LOCK:
+        store, users_doc = _ensure_user_state_locked()
+        holders = store.users_for_account(users_doc, account_id) if account_id else []
+    targets = holders or ["owner"]
+    for uid in targets:
+        if uid == "owner":
+            send_notify(title, html)
+        else:
+            send_notify(title, html, user_id=uid)
 
 
 def notify_completed(s: dict, already: bool) -> None:
@@ -1232,7 +1391,11 @@ def notify_completed(s: dict, already: bool) -> None:
            "订阅启动时该账号已是「已报名」，无需重复提交" if already
            else "已提交报名，并经过「立即复核 + 静默二次确认」两段校验")
     )
-    send_notify("【SVE】自动报名成功 - %s" % (s.get("name") or s.get("tournament_id")), html)
+    notify_for_account(
+        s.get("account_id"),
+        "【SVE】自动报名成功 - %s" % (s.get("name") or s.get("tournament_id")),
+        html,
+    )
 
 
 def notify_time_conflict(s: dict, reason: str, code=None, detail: str = "") -> None:
@@ -1259,11 +1422,14 @@ def notify_time_conflict(s: dict, reason: str, code=None, detail: str = "") -> N
         % (s.get("name"), s.get("tournament_id"), who, reason,
            code or "（服务端未提供）", time.strftime("%Y-%m-%d %H:%M:%S"))
     )
-    send_notify("【SVE】订阅已取消（时间冲突）- %s"
-                % (s.get("name") or s.get("tournament_id")), html)
+    notify_for_account(
+        s.get("account_id"),
+        "【SVE】订阅已取消（时间冲突）- %s" % (s.get("name") or s.get("tournament_id")),
+        html,
+    )
 
 
-def notify_account_purged(account: str, dropped: list, *, reason: str = "") -> None:
+def notify_account_purged(account: str, dropped: list, *, reason: str = "", user_id: str | None = None) -> None:
     """账号被移除、其订阅被自动清理时的通知。
 
     用户明确要求"删账号要通知"——订阅凭空消失会让人以为是自己点的。
@@ -1290,7 +1456,11 @@ def notify_account_purged(account: str, dropped: list, *, reason: str = "") -> N
         % (escape_html(account), reason or "账号已被删除", len(dropped), items,
            time.strftime("%Y-%m-%d %H:%M:%S"))
     )
-    send_notify("【SVE】账号已移除，%d 条订阅已清理 - %s" % (len(dropped), account), html)
+    title = "【SVE】账号已移除，%d 条订阅已清理 - %s" % (len(dropped), account)
+    if user_id and user_id != "owner":
+        send_notify(title, html, user_id=user_id)
+    else:
+        send_notify(title, html)
 
 
 def _record_epoch_locked(key: str) -> int:
@@ -1387,6 +1557,11 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
                 RECORDS_REFRESHING["flag"] = False
 
     threading.Thread(target=worker, daemon=True, name="rec-refresh").start()
+
+
+@app.errorhandler(AuthError)
+def auth_error_handler(error: AuthError):
+    return jsonify({"ok": False, "code": error.code, "error": error.message}), error.status_code
 
 
 @app.errorhandler(AccountConflict)
@@ -1558,16 +1733,33 @@ def proxy_identity_request():
 
 @app.before_request
 def proxy_data_routes():
+    if (
+        request.path == "/api/scheduler/health"
+        and request.remote_addr in {"127.0.0.1", "::1"}
+        and not has_proxy_headers(request.headers)
+    ):
+        g.sve_user = UserContext(user_id="owner", role="admin", email=None, authenticated=True)
+    else:
+        user = resolve_request_user(request.headers, request.remote_addr, os.environ, get_cf_verifier())
+        g.sve_user = user
+        with LOCK:
+            store, users_doc = _ensure_user_state_locked()
+            is_new = user.user_id not in users_doc.get("users", {})
+            old_role = (users_doc.get("users", {}).get(user.user_id) or {}).get("role")
+            store.ensure_user(users_doc, user.user_id, user.role)
+            if (is_new or old_role != user.role) and (_auth_mode() == "cloudflare" or store.path.exists()):
+                store.save(users_doc)
     if STATE["storage_failed"] and request.path.startswith("/api/") and request.path != "/api/scheduler/health":
         return jsonify({"ok": False, "code": "storage_unavailable", "error": "身份存储待核对，执行已暂停；检查存储后重启读取，不覆盖数据快照"})
     if request.method == "POST" and request.content_length and not isinstance(request.get_json(silent=True), dict):
         raise AccountConflict("JSON 请求必须是对象；未执行任何账号操作")
-    if remote_enabled() and request.path in PROXY_ROUTES:
+    if remote_enabled() and current_user().role == "admin" and request.path in PROXY_ROUTES:
         return proxy_identity_request()
 
 
 @app.get("/api/state")
 def api_state():
+    u = current_user()
     selected = request_account(allow_default=True)
     with LOCK:
         accs = [{"account_id": aid, "name": a.name, "uid": a.uid, "nickname": a.nickname,
@@ -1586,14 +1778,16 @@ def api_state():
                                        and sched and not sched.completed and not sched.stop_flag.is_set()),
                           logs=row.get("logs", [])[-60:])
             grouped.setdefault(aid, []).append(output)
+        remote_view = remote_config_view() if u.role == "admin" else {"enabled": False, "restricted": True, "fields": {}}
         return jsonify({"ok": True, "schema_version": 2, "active_account_id": selected,
                         "active": account_label(selected) if selected else None, "accounts": accs,
                         "subs_grouped": grouped, "subs": [row for rows in grouped.values() for row in rows],
                         "mine": [row["tournament_id"] for row in STATE["subs"].values() if row["account_id"] == selected],
-                        "sub_count": len(STATE["subs"]), "pending_count": len(STATE["pending"]),
+                        "sub_count": len(STATE["subs"]), "pending_count": len(STATE["pending"]) if u.role == "admin" else 0,
                         "deleted_accounts": [{"account_id": aid, "version": row["version"], "label": account_label(aid)} for aid, row in STATE["tombstones"].items()],
                         "can_login": login_capability()["can_login"], "login_browser": login_capability()["browser"],
-                        "login": STATE["login"], "log": [], "remote": remote_config_view()})
+                        "login": STATE["login"], "log": [], "remote": remote_view,
+                        "user": {"role": u.role, "notify_configured": is_notify_configured(u.user_id)}})
 
 
 def observed_login():
@@ -2841,11 +3035,13 @@ def summary_payload():
 
 @app.get("/api/accounts/summary")
 def api_accounts_summary():
+    require_admin()
     return jsonify(agent().accounts_summary() if remote_enabled() else summary_payload())
 
 
 @app.post("/api/accounts/sync")
 def api_accounts_sync():
+    require_admin()
     body = request.get_json(silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("accounts"), dict):
         raise AccountConflict("accounts 必须是对象")
