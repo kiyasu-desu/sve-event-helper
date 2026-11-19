@@ -619,6 +619,121 @@ class ServerIsolationTests(unittest.TestCase):
         self.assertFalse(cross_resp["ok"])
         self.assertNotIn("10002", srv.STATE["accounts"])
 
+    def test_remote_mode_blocks_non_admin_subscription_forwarding_and_enforces_bindings(self):
+        srv = self.srv
+        link = Mock()
+        link.accounts_summary.return_value = {
+            "ok": True,
+            "schema_version": 2,
+            "session_write": 2,
+            "subscription_identity": 2,
+            "accounts": [
+                {"account_id": "10001", "uid": 10001, "name": "test-a1", "nickname": "test-a1", "version": 1},
+            ],
+            "tombstones": {},
+        }
+        link.subscribe.return_value = {"ok": True, "account_id": "10001"}
+        link.unsubscribe.return_value = {"ok": True, "account_id": "10001"}
+        with srv.LOCK:
+            srv.STATE["remote"] = {"enabled": True, "host": "sve.example.com", "user": "synthetic-user"}
+            srv.STATE["tunnel"] = Mock(running=True, connection_config=dict(srv.STATE["remote"]))
+        self.patches.enter_context(patch.object(srv, "agent", return_value=link))
+
+        friend_hdrs = self.cf_headers("friend@example.com")
+        for path in ("/api/subscribe", "/api/unsubscribe"):
+            resp = self.client.post(
+                path,
+                json={"account_id": "10001", "tournament_id": "ev1"},
+                headers=friend_hdrs,
+            )
+            self.assertEqual(403, resp.status_code)
+            self.assertEqual("forbidden", resp.get_json()["code"])
+        link.subscribe.assert_not_called()
+        link.unsubscribe.assert_not_called()
+
+    def test_stale_account_cookie_from_another_user_falls_back_to_caller_default_and_clears_cookie(self):
+        srv = self.srv
+        sid_val = "synthetic-" + "sid-10002"
+        acc2 = srv.Account(name="test-a2", sessionid=sid_val, uid=10002, nickname="test-a2")
+        acc2.version = 1
+        with srv.LOCK:
+            srv.STATE["accounts"]["10002"] = acc2
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            store.bind_account(users_doc, "friend@example.com", "user", "10002", select=True)
+            store.save(users_doc)
+
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+
+        # Admin selects 10001, setting sve_account_id=10001 in the shared browser cookie jar.
+        sel_resp = self.client.post("/api/account/select", json={"account_id": "10001"}, headers=admin_hdrs)
+        self.assertTrue(sel_resp.get_json()["ok"])
+        self.assertEqual("10001", self.client.get_cookie("sve_account_id").value)
+
+        # Friend now uses the same browser without an explicit account_id parameter.
+        st_resp = self.client.get("/api/state", headers=friend_hdrs)
+        st_json = st_resp.get_json()
+        self.assertTrue(st_json["ok"])
+        self.assertEqual("10002", st_json["active_account_id"])
+
+        with patch.object(srv.SveClient, "tournaments", return_value=[]):
+            tour_resp = self.client.get("/api/tournaments?area=广东省-广州市&enrich=0", headers=friend_hdrs)
+        self.assertEqual(200, tour_resp.status_code)
+        tour_json = tour_resp.get_json()
+        self.assertTrue(tour_json["ok"], tour_json)
+        self.assertEqual("10002", tour_json["account_id"])
+
+    def test_login_status_is_scoped_per_user_without_leaking_nickname_or_uid(self):
+        srv = self.srv
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+
+        with srv.LOCK:
+            srv.STATE["login"] = {
+                "running": False,
+                "ok": True,
+                "message": "登录成功: test-secret-admin (uid=10001)",
+                "error": "",
+                "user_id": "owner",
+            }
+            srv.STATE.setdefault("login_by_user", {})["owner"] = dict(srv.STATE["login"])
+
+        admin_st = self.client.get("/api/state", headers=admin_hdrs).get_json()
+        self.assertTrue(admin_st["login"]["ok"])
+        self.assertIn("10001", admin_st["login"]["message"])
+
+        friend_st = self.client.get("/api/state", headers=friend_hdrs).get_json()
+        self.assertFalse(friend_st["login"]["ok"])
+        self.assertEqual("", friend_st["login"]["message"])
+        self.assertNotIn("10001", json.dumps(friend_st["login"]))
+
+        friend_status = self.client.get("/api/login/status", headers=friend_hdrs).get_json()
+        self.assertFalse(friend_status["ok"])
+        self.assertEqual("", friend_status["message"])
+
+    def test_forget_account_Saves_user_store_before_retiring_dataset_or_rolls_back(self):
+        srv = self.srv
+        admin_hdrs = self.cf_headers("admin@example.com")
+        with srv.LOCK:
+            store, _ = srv._ensure_user_state_locked()
+
+        with patch.object(store, "save", side_effect=OSError("synthetic users-v1 disk full")):
+            resp = self.client.post(
+                "/api/account/forget",
+                json={"account_id": "10001", "expected_version": 1, "operation_id": "op-atomic-fail-1"},
+                headers=admin_hdrs,
+            )
+            self.assertFalse(resp.get_json()["ok"])
+
+        # Since user_store.save failed, the account and subscription must remain intact (not half-deleted).
+        self.assertIn("10001", srv.STATE["accounts"])
+        self.assertNotIn("10001", srv.STATE["tombstones"])
+        persisted = srv.IdentityStore(self.data).load()
+        self.assertIn("10001", persisted["accounts"])
+        self.assertNotIn("10001", persisted["tombstones"])
+
+
 
 
 if __name__ == "__main__":
