@@ -250,6 +250,7 @@ button.small.act { min-width: 84px; text-align: center; }
      改为**换行**显示：长行换到下一行继续，不用横向滚动，也不省略。 */
   .latest { margin-top:4px; font:11px/1.5 Consolas,monospace; color:#9fd0ff;
             white-space:normal; overflow-wrap:anywhere; }
+  #notifySetupBanner[hidden], #remoteSection[hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -288,6 +289,11 @@ button.small.act { min-width: 84px; text-align: center; }
   <p id="batchSummary" role="status"></p>
   <div id="batchDetails" tabindex="0" role="region" aria-label="逐项报名结果"></div>
 </dialog>
+
+<div id="notifySetupBanner" class="banner info" role="status" hidden style="margin:10px 14px 0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+  <span>尚未配置消息接收，自动报名成功将无法推送通知。</span>
+  <button id="btnGoNotifySetup" type="button" class="small primary">去配置通知</button>
+</div>
 
 <main id="eventsPage">
   <!-- 账号 -->
@@ -346,7 +352,7 @@ button.small.act { min-width: 84px; text-align: center; }
     <button id="btnAppServer" type="button" hidden>更换服务器地址</button>
   </section>
   <!-- 远端执行：订阅与自动报名交给服务器，本机只做交互与登录 -->
-  <section>
+  <section id="remoteSection">
     <h2>自动报名执行位置</h2>
     <div id="remoteBox">正在读取执行位置…</div>
     <details style="margin-top:10px">
@@ -628,6 +634,8 @@ async function refresh({signal, reloadEventsOnAccountChange = true} = {}) {
 
     // Configuration values remain on the execution side; display status only.
     renderRemoteStatus(s.remote || {});
+    USER_STATE = s.user || {role: "admin", notify_configured: true};
+    updateUserRoleAndBanner();
 
     // 「新增账号」的可见性：分两种环境，不能只看 can_login。
     //
@@ -717,6 +725,25 @@ let LAST_ACTIVE;   // 记录上次看到的激活账号，用于检测切换
 let MINE = new Set();   // 当前账号已订阅的赛事 id（由 /api/state 提供）
 let MY_TOURS = [];      // 当前账号的「我的赛事」（服务端 mine=1 筛选）
 let REMOTE_ON = false;  // 是否处于「服务器执行」模式
+let USER_STATE = {role: "admin", notify_configured: true};
+
+function updateUserRoleAndBanner() {
+  const remoteSec = $("remoteSection");
+  if (remoteSec) remoteSec.hidden = USER_STATE.role !== "admin";
+  const banner = $("notifySetupBanner");
+  if (banner) {
+    banner.hidden = USER_STATE.notify_configured !== false || currentPage === "settings";
+  }
+}
+
+$("btnGoNotifySetup").onclick = () => {
+  const nextUrl = APP_ROOT + "settings";
+  history.pushState(null, "", nextUrl);
+  try { if (location.pathname !== nextUrl) location.pathname = nextUrl; } catch (_) {}
+  showLocation();
+  $("notifyDetails").open = true;
+  $("notifyDetails").scrollIntoView?.({behavior: "smooth", block: "nearest"});
+};
 
 // ------------------------------------------------------------------ 通知设置
 const NOTIFY_FIELDS = {
@@ -873,6 +900,8 @@ async function saveNotifyConfig() {
     if (r.ok) {
       NOTIFY_SEQUENCE++; NOTIFY_CFG = r;
       renderNotifySummary(r);
+      USER_STATE.notify_configured = Boolean(r.channels?.pushplus?.enabled || r.channels?.email?.enabled);
+      updateUserRoleAndBanner();
       if (version === notifyEditVersion) { notifyFormDirty = false; renderNotifyForm(); }
     }
   } catch { setSettingsStatus("网络不可用，通知配置未确认保存，请检查网络。", "err"); }
@@ -1235,6 +1264,25 @@ function clearPending(tid) { PENDING.delete(String(tid)); updateAction(tid); }
 // 就会覆盖上面的统一入口，把刚消除的"两区各画各的"缺陷重新引入。
 
 const MANUAL_REFRESH_TIMEOUT = 30000;
+const AREA_STORAGE_KEY = "sve.area.v1";
+
+function readSavedArea() {
+  try {
+    const storage = typeof localStorage !== "undefined" ? localStorage : window.localStorage;
+    const raw = storage?.getItem?.(AREA_STORAGE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.province === "string") return obj;
+  } catch (_) {}
+  return null;
+}
+
+function saveSelectedArea(province, city) {
+  try {
+    const storage = typeof localStorage !== "undefined" ? localStorage : window.localStorage;
+    storage?.setItem?.(AREA_STORAGE_KEY, JSON.stringify({province, city}));
+  } catch (_) {}
+}
 
 async function loadAreas() {
   // The shared request can outlive one gesture, but must release its slot after a timeout.
@@ -1250,10 +1298,20 @@ async function loadAreas() {
   AREAS = r.provinces;
   const pv = $("province");
   pv.innerHTML = AREAS.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
-  // 默认选中广东省（有赛事且是本项目的主要地区）
-  const gi = AREAS.findIndex(p => p.name === "广东省");
-  pv.selectedIndex = gi >= 0 ? gi : 0;
-  fillCities("广州市");
+  const saved = readSavedArea();
+  const savedIdx = saved ? AREAS.findIndex(p => p.name === saved.province) : -1;
+  if (savedIdx >= 0) {
+    pv.selectedIndex = savedIdx;
+    pv.value = AREAS[savedIdx].name;
+    fillCities(saved.city || "");
+  } else {
+    // 默认选中广东省（有赛事且是本项目的主要地区）
+    const gi = AREAS.findIndex(p => p.name === "广东省");
+    const idx = gi >= 0 ? gi : 0;
+    pv.selectedIndex = idx;
+    pv.value = AREAS[idx].name;
+    fillCities("广州市");
+  }
 }
 
 async function queryEvents(signal) {
@@ -1275,7 +1333,10 @@ function fillCities(prefer) {
   const ct = $("city");
   ct.innerHTML = cities.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
   if (prefer && cities.includes(prefer)) ct.value = prefer;
-  else if (cities.length) ct.selectedIndex = 0;
+  else if (cities.length) {
+    ct.selectedIndex = 0;
+    ct.value = cities[0];
+  }
 }
 
 function currentArea() {
@@ -1771,6 +1832,9 @@ $("btnBatch").onclick = batchEnroll;
 $("btnBatchCancel").onclick = batchCancel;
 $("btnLoad").onclick = () => queryEvents();
 function changeArea() {
+  if ($("province").value && $("city").value) {
+    saveSelectedArea($("province").value, $("city").value);
+  }
   pendingEventsScroll = null;
   tournamentQueryError = "";
   PICK_TOURS.clear();
@@ -2297,6 +2361,7 @@ function showLocation() {
     updateBackToTop();
     updateBatchButton();
     configureAppServerSwitch();
+    updateUserRoleAndBanner();
     return;
   }
   discardMovedEventsScroll();
@@ -2310,6 +2375,7 @@ function showLocation() {
   pullRefresh.cancel();
   for (const [name, panel] of Object.entries(panels)) panel.hidden = name !== page;
   configureAppServerSwitch();
+  updateUserRoleAndBanner();
   for (const link of pageLinks) {
     if (link.dataset.page === page) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");

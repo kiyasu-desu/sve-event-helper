@@ -1026,21 +1026,21 @@ test('PWA activation retires old shells and online navigation caches the shipped
   const c=vm.createContext({URL,
     self:{location:{origin:'https://sve.example.com'},registration:{scope:'https://sve.example.com/'},
       addEventListener(name,fn){handlers[name]=fn;},clients:{async claim(){}}},
-    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell'];},
+    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell','sve-v29-multi-user-isolation-shell'];},
       async delete(key){deleted.push(key);},async open(key){return {async put(req,response){stored.push({key,response});}};},
       async match(){throw Error('online navigation must use the fresh page');}},
     fetch:async()=>fresh});
   vm.runInContext(fs.readFileSync('app/client/ui/sw.js','utf8'),c);
-  assert.equal(vm.runInContext('VERSION',c),'sve-v28-public-repo');
+  assert.equal(vm.runInContext('VERSION',c),'sve-v29-multi-user-isolation');
   let pending;
   handlers.activate({waitUntil(value){pending=value;}});
   await pending;
-  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell']);
+  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell']);
   handlers.fetch({request:{method:'GET',mode:'navigate',url:'https://sve.example.com/settings'},
     respondWith(value){pending=value;}});
   assert.equal((await pending).body,html);
   assert.equal(stored.length,1);
-  assert.equal(stored[0].key,'sve-v28-public-repo-shell');
+  assert.equal(stored[0].key,'sve-v29-multi-user-isolation-shell');
   assert.match(stored[0].response.body,/<meta name="sve-repository" content="https:\/\/github.com\/kiyasu-desu\/sve-event-helper">/);
 });
 
@@ -1978,3 +1978,82 @@ test('all-skip batch results clear settled tournament picks for cancel and enrol
     h.run('closeBatchResult()');
   }
 });
+
+test('non-admin hides remote section and unconfigured user sees notify onboarding banner',async()=>{
+  const h=harness('/');
+  let currentUser={role:'user',email:'player1@example.com',notify_configured:false};
+  h.context.fetch=async path=>{
+    const url=new URL(path,'https://example.com');
+    if(url.pathname==='/api/state') {
+      return {json:async()=>({...state(),user:currentUser})};
+    }
+    if(url.pathname==='/api/notify/config') {
+      return {json:async()=>({ok:true,channels:{pushplus:{enabled:false},email:{enabled:false}}})};
+    }
+    return {json:async()=>({ok:true})};
+  };
+  h.run('currentPage="events";');
+  await h.run('refresh()');
+  assert.equal(h.elements.get('remoteSection').hidden,true);
+  assert.equal(h.elements.get('notifySetupBanner').hidden,false);
+
+  // Clicking "去配置通知" navigates to /settings, opens notifyDetails, and hides the banner on settings page
+  h.elements.get('btnGoNotifySetup').onclick();
+  assert.equal(h.context.location.pathname,'/settings');
+  assert.equal(h.run('currentPage'),'settings');
+  assert.equal(h.elements.get('notifyDetails').open,true);
+  assert.equal(h.elements.get('notifySetupBanner').hidden,true);
+
+  // Once notify_configured is true, returning to events keeps the banner hidden
+  currentUser={role:'user',email:'player1@example.com',notify_configured:true};
+  h.context.location.pathname='/';
+  h.run('showLocation()');
+  await h.run('refresh()');
+  assert.equal(h.elements.get('notifySetupBanner').hidden,true);
+  assert.equal(h.elements.get('remoteSection').hidden,true);
+
+  // Admin role keeps remoteSection visible
+  currentUser={role:'admin',email:'owner@example.com',notify_configured:true};
+  await h.run('refresh()');
+  assert.equal(h.elements.get('remoteSection').hidden,false);
+  assert.equal(h.elements.get('notifySetupBanner').hidden,true);
+});
+
+test('remembers last selected area in localStorage with Guangzhou fallback',async()=>{
+  const store=new Map();
+  const fakeStorage={
+    getItem(k){return store.has(k)?store.get(k):null;},
+    setItem(k,v){store.set(k,String(v));},
+  };
+  const provinces=[
+    {name:'广东省',cities:['广州市','深圳市']},
+    {name:'浙江省',cities:['杭州市','宁波市']},
+  ];
+
+  // 1) When localStorage has a valid saved area, loadAreas restores it
+  store.set('sve.area.v1',JSON.stringify({province:'浙江省',city:'宁波市'}));
+  const h1=harness('/');
+  h1.context.localStorage=fakeStorage;
+  h1.context.window.localStorage=fakeStorage;
+  h1.context.fetch=async()=>({json:async()=>({ok:true,provinces})});
+  await h1.run('loadAreas()');
+  assert.equal(h1.elements.get('province').value,'浙江省');
+  assert.equal(h1.elements.get('city').value,'宁波市');
+
+  // 2) Changing city writes the new selection to localStorage
+  h1.elements.get('city').value='杭州市';
+  h1.run('queryEvents=async()=>{}');
+  await h1.run('changeArea()');
+  assert.deepEqual(JSON.parse(store.get('sve.area.v1')),{province:'浙江省',city:'杭州市'});
+
+  // 3) Invalid saved area or throwing localStorage falls back to 广东省-广州市
+  store.set('sve.area.v1',JSON.stringify({province:'不存在省',city:'不存在市'}));
+  const h2=harness('/');
+  h2.context.localStorage=fakeStorage;
+  h2.context.window.localStorage=fakeStorage;
+  h2.context.fetch=async()=>({json:async()=>({ok:true,provinces})});
+  await h2.run('loadAreas()');
+  assert.equal(h2.elements.get('province').value,'广东省');
+  assert.equal(h2.elements.get('city').value,'广州市');
+});
+
