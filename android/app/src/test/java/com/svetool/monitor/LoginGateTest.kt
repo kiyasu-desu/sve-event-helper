@@ -136,12 +136,18 @@ class LoginGateTest {
     fun `清理列表绝不能包含自家域`() {
         // 这是硬约束：我们的域上有 Cloudflare Access 的 CF_Authorization JWT。
         // 一旦把自家域放进清理列表，主界面就会掉登录，用户得重新过一遍 Access。
-        val bad = Cfg.COOKIE_CLEAR_URLS.filter { it.startsWith(Cfg.BASE_URL) }
-        assertEquals("清理列表不得含自家域，实际含: $bad", emptyList<String>(), bad)
+        val neteaseHosts = setOf("nie.netease.com", "163.com")
+        val allUrls = Cfg.COOKIE_CLEAR_URLS + Cfg.COOKIE_URLS
+        val bad = allUrls.filter { raw ->
+            val host = java.net.URI(raw).host?.lowercase() ?: return@filter true
+            neteaseHosts.none { allowed -> host == allowed || host.endsWith(".$allowed") }
+        }
+        assertEquals("清理和读取列表只能含网易域，实际含: $bad", emptyList<String>(), bad)
 
-        // 反向确认：读 Cookie 的列表也不该碰自家域（避免把 Access 的 Cookie 当网易凭据提交）
-        val bad2 = Cfg.COOKIE_URLS.filter { it.startsWith(Cfg.BASE_URL) }
-        assertEquals("取 Cookie 列表不得含自家域，实际含: $bad2", emptyList<String>(), bad2)
+        // 反向确认：自定义服务器域名不会匹配网易清理或读取前缀
+        val customOrigin = "https" + "://sve.example.org"
+        val badPrefix = allUrls.filter { it.startsWith(customOrigin) }
+        assertEquals("不得与用户配置的服务器域名冲突，实际含: $badPrefix", emptyList<String>(), badPrefix)
     }
 
     @Test
