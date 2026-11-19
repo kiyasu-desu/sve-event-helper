@@ -733,6 +733,149 @@ class ServerIsolationTests(unittest.TestCase):
         self.assertIn("10001", persisted["accounts"])
         self.assertNotIn("10001", persisted["tombstones"])
 
+    def test_scheduler_health_rejects_proxied_non_admin_callers(self):
+        srv = self.srv
+        friend_hdrs = self.cf_headers("friend@example.com")
+        admin_hdrs = self.cf_headers("admin@example.com")
+
+        # Non-admin via loopback Cloudflare proxy is denied with 403
+        resp_user = self.client.get("/api/scheduler/health", headers=friend_hdrs)
+        self.assertEqual(403, resp_user.status_code)
+        self.assertEqual("forbidden", resp_user.get_json()["code"])
+
+        # Admin via Cloudflare proxy or direct local watchdog without proxy headers succeeds
+        resp_admin = self.client.get("/api/scheduler/health", headers=admin_hdrs)
+        self.assertEqual(200, resp_admin.status_code)
+        self.assertTrue(resp_admin.get_json()["ok"])
+
+        resp_local = self.client.get("/api/scheduler/health")
+        self.assertEqual(200, resp_local.status_code)
+        self.assertTrue(resp_local.get_json()["ok"])
+
+    def test_records_refresh_is_scoped_to_caller_visible_accounts(self):
+        srv = self.srv
+        sid_val = "synthetic-" + "sid-10002"
+        acc2 = srv.Account(name="test-a2", sessionid=sid_val, uid=10002, nickname="test-a2")
+        acc2.version = 1
+        with srv.LOCK:
+            srv.STATE["accounts"]["10002"] = acc2
+            srv.STATE["records"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "AdminTour", "status": "已报名", "checked_at": 0.0,
+            }
+            srv.STATE["records"]["10002|ev2"] = {
+                "account_id": "10002", "account": "10002", "uid": 10002,
+                "tournament_id": "ev2", "name": "FriendTour", "status": "已报名", "checked_at": 0.0,
+            }
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            store.bind_account(users_doc, "friend@example.com", "user", "10002", select=True)
+            store.save(users_doc)
+
+        friend_hdrs = self.cf_headers("friend@example.com")
+        spawned_targets = []
+
+        def capture_thread(*args, **kwargs):
+            target = kwargs.get("target")
+            if target is not None:
+                spawned_targets.append(target)
+            m = Mock()
+            m.start = Mock()
+            return m
+
+        queried_accounts = []
+
+        def fake_detail(client_self, tid):
+            queried_accounts.append((client_self.account.account_id, tid))
+            return {"name": "RefreshedTour", "zh_user_status": "已报名", "player_num": 4, "max_player_number": 16}
+
+        with patch.object(srv.threading, "Thread", side_effect=capture_thread), \
+                patch.object(srv.SveClient, "detail", autospec=True, side_effect=fake_detail), \
+                patch.object(srv.time, "sleep"):
+            resp = self.client.get("/api/records", headers=friend_hdrs)
+            self.assertEqual(200, resp.status_code)
+            self.assertEqual(1, len(spawned_targets))
+            spawned_targets[0]()
+
+        self.assertEqual([("10002", "ev2")], queried_accounts)
+
+    def test_unbound_user_cannot_delete_shared_live_account_record(self):
+        srv = self.srv
+        with srv.LOCK:
+            srv.STATE["records"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "SharedTour", "status": "已报名", "checked_at": 1e12,
+            }
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            store.bind_account(users_doc, "friend@example.com", "user", "10001", select=True)
+            store.save(users_doc)
+
+        friend_hdrs = self.cf_headers("friend@example.com")
+        # Friend unbinds 10001 while Admin still holds 10001 live.
+        forget_acct = self.client.post(
+            "/api/account/forget",
+            json={"account_id": "10001", "expected_version": 1, "operation_id": "op-friend-unbind-rec"},
+            headers=friend_hdrs,
+        ).get_json()
+        self.assertTrue(forget_acct["ok"])
+        self.assertTrue(forget_acct["shared_remaining"])
+
+        # Friend tries to delete the shared record 10001|ev1 via unbound_history -> 403 forbidden
+        for payload in (
+            {"account_id": "10001", "key": "10001|ev1"},
+            {"key": "10001|ev1"},
+            {"account_id": "10001", "tournament_id": "ev1"},
+        ):
+            resp = self.client.post("/api/records/forget", json=payload, headers=friend_hdrs)
+            self.assertIn(resp.status_code, (200, 403))
+            if resp.status_code == 200:
+                self.assertFalse(resp.get_json()["ok"])
+            else:
+                self.assertEqual("forbidden", resp.get_json()["code"])
+        self.assertIn("10001|ev1", srv.STATE["records"])
+
+    def test_single_mode_fallback_restores_owner_visibility_to_all_accounts(self):
+        srv = self.srv
+        sid_val = "synthetic-" + "sid-10002"
+        acc2 = srv.Account(name="test-a2", sessionid=sid_val, uid=10002, nickname="test-a2")
+        acc2.version = 1
+        with srv.LOCK:
+            srv.STATE["accounts"]["10002"] = acc2
+            srv.STATE["subs"]["10002|ev2"] = {
+                "account_id": "10002", "account": "10002", "uid": 10002,
+                "tournament_id": "ev2", "name": "FriendTour", "enabled": True, "logs": [],
+            }
+            srv.STATE["records"]["10002|ev2"] = {
+                "account_id": "10002", "account": "10002", "uid": 10002,
+                "tournament_id": "ev2", "name": "FriendTour", "status": "已报名", "checked_at": 1e12,
+            }
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            # Ensure owner does not have 10002 bound, and unbind 10001 from owner
+            owner_entry = store.ensure_user(users_doc, "owner", "admin")
+            if "10002" in owner_entry["bound_account_ids"]:
+                owner_entry["bound_account_ids"].remove("10002")
+            store.bind_account(users_doc, "friend@example.com", "user", "10002", select=True)
+            store.unbind_account(users_doc, "owner", "10001", label="test-a1 (UID 10001)")
+            store.save(users_doc)
+
+        # In cloudflare mode, admin sees neither 10001 (unbound) nor 10002 (bound only to friend).
+        admin_hdrs = self.cf_headers("admin@example.com")
+        cf_state = self.client.get("/api/state", headers=admin_hdrs).get_json()
+        self.assertEqual([], [a["account_id"] for a in cf_state["accounts"]])
+
+        # Switch SVE_AUTH_MODE back to single -> owner sees and can operate on all live accounts (10001 and 10002).
+        with patch.dict(os.environ, {"SVE_AUTH_MODE": "single"}):
+            single_state = self.client.get("/api/state").get_json()
+            self.assertEqual(["10001", "10002"], sorted(a["account_id"] for a in single_state["accounts"]))
+            self.assertEqual(["10002|ev2"], [s["key"] for s in single_state["subs"]])
+            with patch.object(srv.SveClient, "tournaments", return_value=[]):
+                t_resp = self.client.get("/api/tournaments?account_id=10002&enrich=0")
+                self.assertEqual(200, t_resp.status_code)
+                self.assertTrue(t_resp.get_json()["ok"])
+
+
 
 
 

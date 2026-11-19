@@ -1037,6 +1037,8 @@ def compare_remote_accounts() -> dict:
 def visible_account_ids(user_id: str | None = None) -> set[str]:
     uid = current_user().user_id if user_id is None else user_id
     with LOCK:
+        if uid == "owner" and _auth_mode() != "cloudflare":
+            return set(STATE["accounts"].keys())
         store, users_doc = _ensure_user_state_locked()
         return set(store.bound_accounts(users_doc, uid)) & set(STATE["accounts"].keys())
 
@@ -1047,6 +1049,8 @@ def user_known_history_ids(user_id: str | None = None) -> set[str]:
         store, users_doc = _ensure_user_state_locked()
         history = set(store.unbound_history(users_doc, uid).keys())
         if uid == "owner":
+            if _auth_mode() != "cloudflare":
+                return history | set(STATE["tombstones"].keys())
             other_known = set()
             for k, entry in (users_doc.get("users") or {}).items():
                 if k != "owner":
@@ -1062,6 +1066,10 @@ def authorize_account(aid: str, user_id: str | None = None, *, allow_history: bo
     uid = current_user().user_id if user_id is None else user_id
     with LOCK:
         store, users_doc = _ensure_user_state_locked()
+        if uid == "owner" and _auth_mode() != "cloudflare":
+            if aid in STATE["accounts"] or (allow_history and aid in STATE["tombstones"]):
+                return
+            return
         visible = set(store.bound_accounts(users_doc, uid)) & set(STATE["accounts"].keys())
         if aid in visible:
             return
@@ -1634,8 +1642,9 @@ def add_record(account: str, uid, tid, name: str, source: str,
         persist_records()
 
 
-def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
+def refresh_records(max_age: float = RECORD_TTL, account_id=None, account_ids=None) -> None:
     """后台回查每条已报名记录的真实状态（同一时刻只跑一个）。"""
+    allowed_set = set(account_ids) if account_ids is not None else None
     with LOCK:
         if RECORDS_REFRESHING["flag"]:
             return
@@ -1644,6 +1653,7 @@ def refresh_records(max_age: float = RECORD_TTL, account_id=None) -> None:
         stale = [(k, dict(v), epochs.get(k, 0)) for k, v in STATE["records"].items()
                  if k not in cancelling
                  and (account_id is None or v["account_id"] == account_id)
+                 and (allowed_set is None or v["account_id"] in allowed_set)
                  and v["account_id"] in STATE["accounts"]
                  and time.time() - float(v.get("checked_at") or 0) > max_age]
         RECORDS_REFRESHING["flag"] = True
@@ -1785,6 +1795,8 @@ def api_scheduler_health():
     # Local watchdog protocol; no nicknames, logs, sessions or upstream requests.
     if request.remote_addr not in {"127.0.0.1", "::1"}:
         return jsonify({"ok": False, "code": "loopback_required"}), 403
+    if has_proxy_headers(request.headers):
+        require_admin()
     if not LOCK.acquire(timeout=0.2):
         return jsonify({"ok": False, "code": "state_busy"}), 503
     try:
@@ -1908,9 +1920,9 @@ def _login_view_for_user(user_id: str | None = None) -> dict:
 def api_state():
     u = current_user()
     selected = request_account(allow_default=True)
+    visible = visible_account_ids(u.user_id)
     with LOCK:
         store, users_doc = _ensure_user_state_locked()
-        visible = set(store.bound_accounts(users_doc, u.user_id)) & set(STATE["accounts"].keys())
         accs = [{"account_id": aid, "name": a.name, "uid": a.uid, "nickname": a.nickname,
                  "label": account_label(aid), "version": a.version, "active": aid == selected,
                  **profile_status(a)}
@@ -3097,7 +3109,7 @@ def api_records():
             raise AccountConflict("记录账号 ID 不存在")
     elif any(field in request.args for field in ("account", "name")):
         selected = request_account(request.args)
-    refresh_records(account_id=selected)
+    refresh_records(account_id=selected, account_ids=visible if selected is None else None)
     with LOCK:
         grouped = {}
         for key, record in STATE["records"].items():
@@ -3159,7 +3171,7 @@ def api_records_forget():
         aid = normalized_uid(body["account_id"])
         if "expected_uid" in body and normalized_uid(body["expected_uid"]) != aid:
             raise AccountConflict("记录的 UID 与账号 ID 不一致")
-        authorize_account(aid, u.user_id, allow_history=True)
+        authorize_account(aid, u.user_id, allow_history=aid not in STATE["accounts"])
         if aid not in STATE["accounts"] and aid not in STATE["tombstones"]:
             raise AccountConflict("记录的账号 ID 不存在")
         if body.get("key"):
@@ -3171,6 +3183,13 @@ def api_records_forget():
         key = sub_key(aid, tid)
     elif body.get("key"):
         old_account, tid = split_sub_key(body["key"])
+        if not remote_enabled() and isinstance(old_account, str) and old_account.strip():
+            try:
+                cand_uid = normalized_uid(old_account)
+            except AccountConflict:
+                cand_uid = None
+            if cand_uid and cand_uid in STATE["accounts"] and cand_uid not in visible_account_ids(u.user_id):
+                authorize_account(cand_uid, u.user_id, allow_history=False)
         aid = resolve(identity_accounts(), old_account, explicit="account_id" in body) if "account_id" not in body else request_account(body)
         key = sub_key(aid, tid)
     else:
