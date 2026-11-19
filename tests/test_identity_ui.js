@@ -1004,11 +1004,12 @@ test('the account header changes ID immediately on selection and clears an inval
   assert.equal(h.elements.get('activeUid').hidden,true);
 });
 
-test('all app pages initialize the GitHub entry from the shipped M21 metadata',()=>{
+test('all app pages initialize the GitHub entry from the shipped M21 metadata without private-repo wording',()=>{
   const expected='https://github.com/kiyasu-desu/sve-event-helper';
   const html=fs.readFileSync('app/client/ui/index.html','utf8');
-  assert.match(html,/私有仓库需 GitHub 登录及访问权限/);
+  assert.doesNotMatch(html,/私有仓库需 GitHub 登录及访问权限|githubAccessHint/);
   assert.match(html,/<a id="projectGithub" target="_self" rel="noreferrer"/);
+  assert.doesNotMatch(html,/id="projectGithub"[^>]*aria-describedby/);
   for(const route of ['/','/subs','/settings','/test-mount/settings']) {
     const h=harness(route),link=h.elements.get('projectGithub');
     assert.equal(link.href,expected);
@@ -1025,21 +1026,21 @@ test('PWA activation retires old shells and online navigation caches the shipped
   const c=vm.createContext({URL,
     self:{location:{origin:'https://sve.example.com'},registration:{scope:'https://sve.example.com/'},
       addEventListener(name,fn){handlers[name]=fn;},clients:{async claim(){}}},
-    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell'];},
+    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell'];},
       async delete(key){deleted.push(key);},async open(key){return {async put(req,response){stored.push({key,response});}};},
       async match(){throw Error('online navigation must use the fresh page');}},
     fetch:async()=>fresh});
   vm.runInContext(fs.readFileSync('app/client/ui/sw.js','utf8'),c);
-  assert.equal(vm.runInContext('VERSION',c),'sve-v27-m22-batch-cancel');
+  assert.equal(vm.runInContext('VERSION',c),'sve-v28-public-repo');
   let pending;
   handlers.activate({waitUntil(value){pending=value;}});
   await pending;
-  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell']);
+  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell']);
   handlers.fetch({request:{method:'GET',mode:'navigate',url:'https://sve.example.com/settings'},
     respondWith(value){pending=value;}});
   assert.equal((await pending).body,html);
   assert.equal(stored.length,1);
-  assert.equal(stored[0].key,'sve-v27-m22-batch-cancel-shell');
+  assert.equal(stored[0].key,'sve-v28-public-repo-shell');
   assert.match(stored[0].response.body,/<meta name="sve-repository" content="https:\/\/github.com\/kiyasu-desu\/sve-event-helper">/);
 });
 
@@ -1327,6 +1328,21 @@ test('installed native login keeps its URL scheme even when the injected version
   assert.match(calls[0].url,/^\/api\/login\/intent/);
   assert.equal(calls[0].body.restore_account_id,'10001');
   assert.equal(h.context.location.href,'sve://login');
+});
+
+test('app server switch button stays hidden in browsers and triggers sve://server in native app',()=>{
+  const browser=harness('/settings');
+  assert.equal(browser.elements.get('appServerSection').hidden,true);
+  assert.equal(browser.elements.get('btnAppServer').hidden,true);
+  const app=harness('/settings');
+  app.context.window.__SVE_APP__=true;
+  app.run('configureAppServerSwitch()');
+  const section=app.elements.get('appServerSection');
+  const btn=app.elements.get('btnAppServer');
+  assert.equal(section.hidden,false);
+  assert.equal(btn.hidden,false);
+  btn.onclick();
+  assert.equal(app.context.location.href,'sve://server');
 });
 
 test('deleting the selected account clears both views before loading the remaining account',async()=>{
