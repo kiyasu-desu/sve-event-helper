@@ -100,6 +100,7 @@ git push origin v1.6.0
 2. 安装 `app-release.apk` 后，按引导输入服务端 HTTPS 根地址并完成认证即可进入主界面。
 3. 通知渠道（PushPlus / 邮件）与 `SVE_APP_KEY` 需在自部署环境或登录后「设置」页自行配置。
 4. 兼容现有服务端 `/api/login/cookie` 与既有工作流；普通后台网页更新仍无需重装 APK。
+5. 既有通过旧版 `assembleDebug` 自建安装的用户无需被迫切换；若保留本地 WebView / Cloudflare Access Cookie 原地升级原生端，请在原构建机继续运行 `assembleDebug`（`versionCode = 3`）；若首次切换为本公开正式签名版 `app-release.apk`，需先卸载旧 `debug` 包（服务端账号与订阅不会丢失，仅需重新填写服务器地址并过一次 Access 验证），此后同签名 Release 均可直接覆盖升级。
 
 ## 校验信息
 
@@ -116,6 +117,8 @@ git push origin v1.6.0
   - 后端/调度/发布 Python 单元测试（`tests/test_m*.py`）及脚本/行尾/PowerShell/越界写静态检查（`check_scripts.py`、`check_lineendings.py`、`check_ps1.py`、`audit_paths.py`）；
   - Android 单元测试（`LoginGateTest` 与 `ServerUrlValidatorTest`）、Debug 构建（`testDebugUnitTest assembleDebug`）、`release` 防私有地址构建拦截，以及临时测试 keystore 的 `assembleRelease` 签名与产物域名洁净度检查；
   - `scripts/security/test_scan_repository.py` 与 `scripts/security/scan_repository.py`（`working` / `index` / `tree --ref HEAD` / `range --ref main..HEAD`）全量隐私门禁。
+- **既有安装与升级边界**：
+  - 本发布版沿用 `AGENTS.md` 兼容性约束：既有 v1.5 `app-debug.apk` 不要求重装即可兼容服务端与 Web 更新；需保留本地 WebView Cookie 升级原生端时可沿用同机 `assembleDebug`（`versionCode = 3`）；首次切换至公开正式签名 `app-release.apk` 渠道需先卸载旧 `debug` 包（不丢失任何服务端账号/订阅/记录，回退同理装回原 `app-debug.apk`），详见 [Android-App.md](Android-App.md#升级与渠道迁移说明保留兼容性与数据)。
 - **未实测边界（需发布前/真机人工验收）**：
   - 实体 Android 手机侧载 `app-release.apk` 后的首次冷启动引导、错误兜底页触发、长按桌面图标快捷方式、设置页 `sve://server` 跳转、以及在真实 Cloudflare Access 401/403 跳转链与网易官方登录页下的端到端操作；
   - 浏览器/PWA 在真实手机上从 `sve-v27-m22-batch-cancel` 升级至 `sve-v28-public-repo` 的实际联网刷新；

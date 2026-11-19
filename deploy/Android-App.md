@@ -182,7 +182,15 @@ cd sve-monitor\android
 2. 手机上允许「安装未知来源应用」（首次会提示）
 3. 打开「SVE 赛事助手」，在「配置服务器地址」界面输入你的 HTTPS 服务根地址（如 `https://sve.example.com`）并保存；后续如需更换，可在 App 内「设置 → 更换服务器地址」、断网兜底页或长按桌面应用图标快捷方式进入修改
 
-> 用 `adb` 更省事：`adb install -r app-release.apk`（不同签名的旧包如需替换需先确认签名一致）
+> 用 `adb` 更省事：`adb install -r app-release.apk`。
+
+### 升级与渠道迁移说明（保留兼容性与数据）
+
+Android 对同包名（`com.svetool.monitor`）强制校验签名证书一致；`assembleDebug` 使用各台构建机本地的 `debug.keystore`（公开固定口令、机器间证书互不相同），因此不能将其用于 GitHub Releases 公开分发，也无法通过跨证书密钥轮换直接覆盖。既有用户按自身需求选择以下三条路径之一：
+
+1. **继续沿用既有 v1.5 私人 `app-debug.apk`（免重装）**：普通服务端与 Web/PWA 升级不要求重装 APK，现有 Cloudflare Access 登录态与 `/api/login/cookie` 兼容性完全保留。
+2. **从 v1.5 `app-debug.apk` 原地升级至 v1.6（保留本地 WebView / Access Cookie）**：在原出包机上执行 `gradle --no-daemon assembleDebug`（或带 `-PsveUsePrivateUrl=true`）。因包名相同、仍使用同一本机 debug 签名且 `versionCode` 由 `2` 升为 `3`，可直接 `adb install -r app-debug.apk` 覆盖升级，不清除 WebView Cookie。
+3. **一次性切换至公开正式签名 `app-release.apk` 渠道**：首次跨渠道安装前需先卸载旧 `app-debug.apk`，再安装 `app-release.apk`。卸载仅清除手机本机 WebView 缓存的 Cloudflare Access Cookie（重新进入填写 HTTPS 地址并完成一次 Access 验证即可），**账号、订阅、报名记录与设置均保存在服务端，不会丢失**；切换后由同一正式签名密钥签出的后续 `app-release.apk` 版本均可直接覆盖升级。如需回退回原 `debug` 渠道，同理卸载后装回原 `app-debug.apk` 即可。
 
 ---
 
