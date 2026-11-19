@@ -61,3 +61,17 @@ SVE_ALLOW_LOCAL_ADMIN=1
 3. **成对回退**：
    - 若通过 `deploy/release.py rollback --target <install_dir> --writers-stopped` 回退至旧版本代码，旧版本直接忽略 `users-v1.json` 与 `users/` 目录，继续读取完好的 `identity-v2.json` 与 `<SVE_DATA_DIR>/notify.json`。
    - 若仅需临时退回单用户模式，将 `SVE_AUTH_MODE=single`（或注释掉 `SVE_AUTH_MODE`）并重启 `sve-agent` 即可。
+
+---
+
+## 5. 侧边栏退出登录、通知横幅关闭与网页端新增账号引导
+
+1. **侧边栏结构与双端「退出登录」**：
+   - 侧边栏主导航区依次包含「赛事列表」「自动报名订阅」「设置」，底部栏放置项目 GitHub 入口与「退出登录」按钮（仅在 `user.auth_mode !== "single"` 时显示；单机免登录模式自动隐藏）。
+   - 确认退出后，前端先调用 `POST /api/auth/logout` 清理服务端响应中的 `sve_account_id`、`sve_login_intent` 与当前域 `CF_Authorization` Cookie，并清除本地通知横幅关闭标记：
+     - Android App v1.7+（`window.__SVE_VER__.code >= 4`）触发原生 `sve://logout`，清空 WebView Cookie（含 Cloudflare Access 团队域认证态）并重载入口页以便切换账号；
+     - 普通网页端与旧版 APK（`versionCode <= 3`）自动回退跳转 `/cdn-cgi/access/logout`，不强制重装旧版 APK。
+2. **未配置通知横幅可关闭**：
+   - 未配置推送渠道的用户点击顶部提示右侧「关闭」后，横幅立即隐藏并记录到 `localStorage`（`sve.notify_banner_dismissed.v1`，带内存态兜底），2 秒轮询不再重新弹出；点击「退出登录」切换账号时自动重置该标记。
+3. **网页端「新增账号」引导**：
+   - 在无本地浏览器的服务端网页端访问时，「新增账号」按钮保持常显；点击后不请求 `/api/login/intent` 与 `/api/login/start`，而是在界面展示手机 App 引导提示（因官方会话 Cookie 属于跨域 `HttpOnly`，纯浏览器网页 JS 无法读取），并在轮询期间保留该引导直至登录状态变更或切换/退出账号。
