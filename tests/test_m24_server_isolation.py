@@ -409,6 +409,217 @@ class ServerIsolationTests(unittest.TestCase):
             self.assertEqual(200, health.status_code)
             self.assertEqual(401, self.client.get("/api/state", environ_overrides={"REMOTE_ADDR": "127.0.0.1"}).status_code)
 
+    def test_cross_user_account_and_record_access_denied(self):
+        srv = self.srv
+        with srv.LOCK:
+            srv.STATE["accounts"]["10002"] = fake_account(srv, 10002, "friend-acct")
+            srv.STATE["subs"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "OwnerEvent", "enabled": True, "logs": [],
+            }
+            srv.STATE["subs"]["10002|ev2"] = {
+                "account_id": "10002", "account": "10002", "uid": 10002,
+                "tournament_id": "ev2", "name": "FriendEvent", "enabled": True, "logs": [],
+            }
+            srv.STATE["records"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "OwnerEvent", "status": "已报名", "checked_at": 1e12,
+            }
+            srv.STATE["records"]["10002|ev2"] = {
+                "account_id": "10002", "account": "10002", "uid": 10002,
+                "tournament_id": "ev2", "name": "FriendEvent", "status": "已报名", "checked_at": 1e12,
+            }
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            users_doc["users"]["owner"]["bound_account_ids"] = ["10001"]
+            users_doc["users"]["owner"]["active_account_id"] = "10001"
+            store.bind_account(users_doc, "friend@example.com", "user", "10002", select=True)
+            store.save(users_doc)
+
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+
+        admin_state = self.client.get("/api/state", headers=admin_hdrs).get_json()
+        self.assertEqual(["10001"], [a["account_id"] for a in admin_state["accounts"]])
+        self.assertEqual("10001", admin_state["active_account_id"])
+        self.assertEqual(["10001|ev1"], [s["key"] for s in admin_state["subs"]])
+        self.assertEqual(["ev1"], admin_state["mine"])
+        self.assertEqual(1, admin_state["sub_count"])
+
+        friend_state = self.client.get("/api/state", headers=friend_hdrs).get_json()
+        self.assertEqual(["10002"], [a["account_id"] for a in friend_state["accounts"]])
+        self.assertEqual("10002", friend_state["active_account_id"])
+        self.assertEqual(["10002|ev2"], [s["key"] for s in friend_state["subs"]])
+        self.assertEqual(["ev2"], friend_state["mine"])
+        self.assertEqual(1, friend_state["sub_count"])
+
+        admin_recs = self.client.get("/api/records", headers=admin_hdrs).get_json()
+        self.assertEqual(["10001|ev1"], [r["key"] for r in admin_recs["records"]])
+        friend_recs = self.client.get("/api/records", headers=friend_hdrs).get_json()
+        self.assertEqual(["10002|ev2"], [r["key"] for r in friend_recs["records"]])
+
+        # Friend attempting any operation on Owner's UID 10001 -> HTTP 403 forbidden.
+        forbidden_calls = [
+            ("GET", "/api/tournaments?account_id=10001", None),
+            ("GET", "/api/my_tournaments?account_id=10001", None),
+            ("GET", "/api/detail?account_id=10001&tournament_id=ev1", None),
+            ("POST", "/api/subscribe", {"account_id": "10001", "tournament_id": "ev9"}),
+            ("POST", "/api/unsubscribe", {"account_id": "10001", "tournament_id": "ev1"}),
+            ("POST", "/api/enroll", {"account_id": "10001", "tournament_id": "ev1"}),
+            ("POST", "/api/cancel", {"account_id": "10001", "tournament_id": "ev1"}),
+            ("POST", "/api/batch_enroll", {"account_ids": ["10001"], "tournaments": ["ev1"]}),
+            ("POST", "/api/batch_cancel", {"account_ids": ["10001"], "tournaments": ["ev1"]}),
+            ("POST", "/api/account/select", {"account_id": "10001"}),
+            ("POST", "/api/account/forget", {"account_id": "10001", "expected_version": 1, "operation_id": "op-cross-forget-1"}),
+            ("POST", "/api/account/profile/refresh", {"account_id": "10001", "expected_version": 1}),
+            ("GET", "/api/records?account_id=10001", None),
+            ("POST", "/api/records/scan", {"account_id": "10001"}),
+            ("POST", "/api/records/forget", {"account_id": "10001", "key": "10001|ev1"}),
+        ]
+        for method, path, body in forbidden_calls:
+            with self.subTest(caller="friend", method=method, path=path):
+                resp = self.client.open(path, method=method, json=body, headers=friend_hdrs)
+                self.assertEqual(403, resp.status_code)
+                self.assertEqual("forbidden", resp.get_json()["code"])
+
+        # Owner attempting to operate on Friend's unshared UID 10002 -> HTTP 403 forbidden.
+        for method, path, body in (
+            ("GET", "/api/tournaments?account_id=10002", None),
+            ("POST", "/api/account/forget", {"account_id": "10002", "expected_version": 1, "operation_id": "op-admin-cross-1"}),
+            ("GET", "/api/records?account_id=10002", None),
+        ):
+            with self.subTest(caller="admin", method=method, path=path):
+                resp = self.client.open(path, method=method, json=body, headers=admin_hdrs)
+                self.assertEqual(403, resp.status_code)
+                self.assertEqual("forbidden", resp.get_json()["code"])
+
+    def test_real_login_binds_existing_shared_uid_and_shares_subs_and_records(self):
+        srv = self.srv
+        sched = Mock(completed=False, attempts=1)
+        sched.stop_flag.is_set.return_value = False
+        with srv.LOCK:
+            srv.STATE["subs"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "SharedTour", "enabled": True, "logs": [],
+            }
+            srv.STATE["schedulers"]["10001|ev1"] = sched
+            srv.STATE["records"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "SharedTour", "status": "已报名", "checked_at": 1e12,
+            }
+            srv.persist_dataset()
+
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+
+        # Before login, friend sees no accounts.
+        before_state = self.client.get("/api/state", headers=friend_hdrs).get_json()
+        self.assertEqual([], before_state["accounts"])
+        self.assertEqual([], before_state["subs"])
+
+        # Friend initiates login intent and completes /api/login/cookie for UID 10001.
+        intent_resp = self.client.post("/api/login/intent", json={}, headers=friend_hdrs)
+        self.assertTrue(intent_resp.get_json()["ok"])
+        with patch.object(srv.SveClient, "login_with_cookie", return_value="synthetic-shared-new-sid"), \
+                patch.object(srv.SveClient, "info", return_value={"id": 10001, "nickname": "test-shared-hero"}):
+            login_resp = self.client.post(
+                "/api/login/cookie",
+                json={"cookies": "NTES_SESS=fake-cookie-value"},
+                headers=friend_hdrs,
+            ).get_json()
+        self.assertTrue(login_resp["ok"], login_resp)
+        self.assertEqual("10001", login_resp["account_id"])
+        self.assertEqual(2, srv.STATE["accounts"]["10001"].version)
+        self.assertEqual("synthetic-shared-new-sid", srv.STATE["accounts"]["10001"].sessionid)
+        self.assertIs(sched, srv.STATE["schedulers"]["10001|ev1"])
+
+        # Now both Admin and Friend see UID 10001, its subscription, and its record.
+        for hdrs in (admin_hdrs, friend_hdrs):
+            st = self.client.get("/api/state", headers=hdrs).get_json()
+            self.assertEqual(["10001"], [a["account_id"] for a in st["accounts"]])
+            self.assertEqual(["10001|ev1"], [s["key"] for s in st["subs"]])
+            recs = self.client.get("/api/records", headers=hdrs).get_json()
+            self.assertEqual(["10001|ev1"], [r["key"] for r in recs["records"]])
+
+    def test_shared_uid_forget_unbinds_without_stopping_other_user_until_last(self):
+        srv = self.srv
+        sched = Mock(completed=False, attempts=0)
+        sched.stop_flag.is_set.return_value = False
+        with srv.LOCK:
+            srv.STATE["subs"]["10001|ev1"] = {
+                "account_id": "10001", "account": "10001", "uid": 10001,
+                "tournament_id": "ev1", "name": "SharedTour", "enabled": True, "logs": [],
+            }
+            srv.STATE["schedulers"]["10001|ev1"] = sched
+            srv.persist_dataset()
+            store, users_doc = srv._ensure_user_state_locked()
+            store.bind_account(users_doc, "friend@example.com", "user", "10001", select=True)
+            store.save(users_doc)
+
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+        dispatch = self.patches.enter_context(patch.object(srv, "dispatch_notification"))
+
+        # Step 1: Admin unbinds UID 10001 while Friend still holds it.
+        res1 = self.client.post("/api/account/forget", json={
+            "account_id": "10001",
+            "expected_version": 1,
+            "operation_id": "op-unbind-admin-10001",
+        }, headers=admin_hdrs).get_json()
+        self.assertTrue(res1["ok"], res1)
+        self.assertTrue(res1["unbound"])
+        self.assertTrue(res1["shared_remaining"])
+        sched.stop.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertIn("10001", srv.STATE["accounts"])
+        self.assertIn("10001|ev1", srv.STATE["subs"])
+        self.assertNotIn("10001", srv.STATE["tombstones"])
+
+        # Admin no longer sees 10001 in active accounts/subs, but sees it in deleted_accounts.
+        admin_st = self.client.get("/api/state", headers=admin_hdrs).get_json()
+        self.assertEqual([], admin_st["accounts"])
+        self.assertEqual([], admin_st["subs"])
+        self.assertEqual(["10001"], [d["account_id"] for d in admin_st["deleted_accounts"]])
+
+        # Friend still sees 10001 and active subscription 10001|ev1.
+        friend_st = self.client.get("/api/state", headers=friend_hdrs).get_json()
+        self.assertEqual(["10001"], [a["account_id"] for a in friend_st["accounts"]])
+        self.assertEqual(["10001|ev1"], [s["key"] for s in friend_st["subs"]])
+
+        # Step 2: Friend unbinds UID 10001 (last holder -> full purge).
+        res2 = self.client.post("/api/account/forget", json={
+            "account_id": "10001",
+            "expected_version": 1,
+            "operation_id": "op-unbind-friend-10001",
+        }, headers=friend_hdrs).get_json()
+        self.assertTrue(res2["ok"], res2)
+        self.assertTrue(res2["unbound"])
+        self.assertFalse(res2["shared_remaining"])
+        sched.stop.assert_called_once()
+        self.assertNotIn("10001", srv.STATE["accounts"])
+        self.assertNotIn("10001|ev1", srv.STATE["subs"])
+        self.assertIn("10001", srv.STATE["tombstones"])
+        dispatch.assert_called_once()
+        self.assertEqual("friend@example.com", dispatch.call_args.kwargs.get("user_id"))
+
+    def test_login_intent_cookie_cannot_cross_users(self):
+        srv = self.srv
+        admin_hdrs = self.cf_headers("admin@example.com")
+        friend_hdrs = self.cf_headers("friend@example.com")
+
+        intent_resp = self.client.post("/api/login/intent", json={}, headers=admin_hdrs)
+        self.assertTrue(intent_resp.get_json()["ok"])
+        with patch.object(srv.SveClient, "login_with_cookie", return_value="synthetic-cross-sid"), \
+                patch.object(srv.SveClient, "info", return_value={"id": 10002, "nickname": "test-cross-attempt"}):
+            cross_resp = self.client.post(
+                "/api/login/cookie",
+                json={"cookies": "NTES_SESS=fake-cookie-value"},
+                headers=friend_hdrs,
+            ).get_json()
+        self.assertFalse(cross_resp["ok"])
+        self.assertNotIn("10002", srv.STATE["accounts"])
+
+
 
 if __name__ == "__main__":
     unittest.main()
