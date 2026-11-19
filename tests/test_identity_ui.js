@@ -1026,21 +1026,21 @@ test('PWA activation retires old shells and online navigation caches the shipped
   const c=vm.createContext({URL,
     self:{location:{origin:'https://sve.example.com'},registration:{scope:'https://sve.example.com/'},
       addEventListener(name,fn){handlers[name]=fn;},clients:{async claim(){}}},
-    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell','sve-v29-multi-user-isolation-shell'];},
+    caches:{async keys(){return ['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell','sve-v29-multi-user-isolation-shell','sve-v30-logout-and-ui-polish-shell'];},
       async delete(key){deleted.push(key);},async open(key){return {async put(req,response){stored.push({key,response});}};},
       async match(){throw Error('online navigation must use the fresh page');}},
     fetch:async()=>fresh});
   vm.runInContext(fs.readFileSync('app/client/ui/sw.js','utf8'),c);
-  assert.equal(vm.runInContext('VERSION',c),'sve-v29-multi-user-isolation');
+  assert.equal(vm.runInContext('VERSION',c),'sve-v30-logout-and-ui-polish');
   let pending;
   handlers.activate({waitUntil(value){pending=value;}});
   await pending;
-  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell']);
+  assert.deepEqual(deleted,['sve-v25-new-repository-shell','sve-v26-m21-repository-link-shell','sve-v27-m22-batch-cancel-shell','sve-v28-public-repo-shell','sve-v29-multi-user-isolation-shell']);
   handlers.fetch({request:{method:'GET',mode:'navigate',url:'https://sve.example.com/settings'},
     respondWith(value){pending=value;}});
   assert.equal((await pending).body,html);
   assert.equal(stored.length,1);
-  assert.equal(stored[0].key,'sve-v29-multi-user-isolation-shell');
+  assert.equal(stored[0].key,'sve-v30-logout-and-ui-polish-shell');
   assert.match(stored[0].response.body,/<meta name="sve-repository" content="https:\/\/github.com\/kiyasu-desu\/sve-event-helper">/);
 });
 
@@ -2055,5 +2055,184 @@ test('remembers last selected area in localStorage with Guangzhou fallback',asyn
   await h2.run('loadAreas()');
   assert.equal(h2.elements.get('province').value,'广东省');
   assert.equal(h2.elements.get('city').value,'广州市');
+});
+
+test('sidebar places settings inside menu-links and logout button inside menu-bottom',()=>{
+  const html=fs.readFileSync('app/client/ui/index.html','utf8');
+  const linksMatch=html.match(/<div class="menu-links">([\s\S]*?)<\/div>\s*<div class="menu-bottom">/);
+  const bottomMatch=html.match(/<div class="menu-bottom">([\s\S]*?)<\/div>\s*<\/nav>/);
+  assert.ok(linksMatch,'expected .menu-links block before .menu-bottom');
+  assert.ok(bottomMatch,'expected .menu-bottom block before </nav>');
+  const navPages=[...linksMatch[1].matchAll(/data-page="(events|subs|settings)"/g)].map(m=>m[1]);
+  assert.deepEqual(navPages,['events','subs','settings']);
+  assert.match(bottomMatch[1],/id="projectGithub"/);
+  assert.match(bottomMatch[1],/id="btnLogout"/);
+  assert.doesNotMatch(bottomMatch[1],/data-page="settings"/);
+});
+
+test('unconfigured user can dismiss notify banner permanently across polls and even without localStorage',async()=>{
+  const store=new Map();
+  const fakeStorage={
+    getItem(k){return store.has(k)?store.get(k):null;},
+    setItem(k,v){store.set(k,String(v));},
+    removeItem(k){store.delete(k);},
+  };
+  const h=harness('/');
+  h.context.localStorage=fakeStorage;
+  h.context.window.localStorage=fakeStorage;
+  h.context.fetch=async()=>({json:async()=>({...state(),user:{role:'user',notify_configured:false,auth_mode:'cloudflare'}})});
+  h.run('currentPage="events";');
+  await h.run('refresh()');
+  assert.equal(h.elements.get('notifySetupBanner').hidden,false);
+
+  h.elements.get('btnDismissNotifyBanner').onclick();
+  assert.equal(store.get('sve.notify_banner_dismissed.v1'),'1');
+  assert.equal(h.elements.get('notifySetupBanner').hidden,true);
+
+  await h.run('refresh()');
+  assert.equal(h.elements.get('notifySetupBanner').hidden,true);
+
+  const hReload=harness('/');
+  hReload.context.localStorage=fakeStorage;
+  hReload.context.window.localStorage=fakeStorage;
+  hReload.context.fetch=async()=>({json:async()=>({...state(),user:{role:'user',notify_configured:false,auth_mode:'cloudflare'}})});
+  hReload.run('currentPage="events";');
+  await hReload.run('refresh()');
+  assert.equal(hReload.elements.get('notifySetupBanner').hidden,true);
+
+  const brokenStorage={
+    getItem(){throw new Error('denied');},
+    setItem(){throw new Error('denied');},
+    removeItem(){throw new Error('denied');},
+  };
+  const hFallback=harness('/');
+  hFallback.context.localStorage=brokenStorage;
+  hFallback.context.window.localStorage=brokenStorage;
+  hFallback.context.fetch=async()=>({json:async()=>({...state(),user:{role:'user',notify_configured:false,auth_mode:'cloudflare'}})});
+  hFallback.run('currentPage="events";');
+  await hFallback.run('refresh()');
+  assert.equal(hFallback.elements.get('notifySetupBanner').hidden,false);
+  hFallback.elements.get('btnDismissNotifyBanner').onclick();
+  assert.equal(hFallback.elements.get('notifySetupBanner').hidden,true);
+  await hFallback.run('refresh()');
+  assert.equal(hFallback.elements.get('notifySetupBanner').hidden,true);
+});
+
+test('logout clears cookies, resets dismissed banner state, and routes by app version or browser',async()=>{
+  const makeStorage=initial=>{
+    const store=new Map(initial);
+    return {
+      store,
+      api:{
+        getItem(k){return store.has(k)?store.get(k):null;},
+        setItem(k,v){store.set(k,String(v));},
+        removeItem(k){store.delete(k);},
+      },
+    };
+  };
+
+  // Single auth mode hides logout button; cloudflare shows it
+  const hMode=harness('/');
+  let authMode='single';
+  hMode.context.fetch=async()=>({json:async()=>({...state(),user:{role:'admin',notify_configured:true,auth_mode:authMode}})});
+  await hMode.run('refresh()');
+  assert.equal(hMode.elements.get('btnLogout').hidden,true);
+  authMode='cloudflare';
+  await hMode.run('refresh()');
+  assert.equal(hMode.elements.get('btnLogout').hidden,false);
+
+  // Cancelling confirm aborts logout and preserves dismissed banner state
+  const sCancel=makeStorage([['sve.notify_banner_dismissed.v1','1']]);
+  const hCancel=harness('/');
+  hCancel.context.localStorage=sCancel.api;
+  hCancel.context.window.localStorage=sCancel.api;
+  const cancelPosts=[];
+  hCancel.context.confirm=()=>false;
+  hCancel.context.fetch=async(url,opts)=>{
+    if(opts?.method==='POST') cancelPosts.push(url);
+    return {json:async()=>({ok:true})};
+  };
+  await hCancel.elements.get('btnLogout').onclick();
+  assert.deepEqual(cancelPosts,[]);
+  assert.equal(sCancel.store.get('sve.notify_banner_dismissed.v1'),'1');
+  assert.equal(hCancel.context.location.href,undefined);
+
+  // Native App v1.7 (code >= 4) calls POST /api/auth/logout, clears banner flag, and routes to sve://logout
+  const sApp=makeStorage([['sve.notify_banner_dismissed.v1','1']]);
+  const hApp=harness('/');
+  hApp.context.localStorage=sApp.api;
+  hApp.context.window.localStorage=sApp.api;
+  hApp.context.window.__SVE_APP__=true;
+  hApp.context.window.__SVE_VER__={name:'1.7',code:4};
+  const appPosts=[];
+  hApp.context.confirm=()=>true;
+  hApp.context.fetch=async(url,opts)=>{
+    appPosts.push([url,opts?.method||'GET']);
+    return {json:async()=>({ok:true,auth_mode:'cloudflare',logout_url:'/cdn-cgi/access/logout'})};
+  };
+  await hApp.elements.get('btnLogout').onclick();
+  assert.equal(appPosts.length,1);
+  assert.match(appPosts[0][0],/^\/api\/auth\/logout/);
+  assert.equal(appPosts[0][1],'POST');
+  assert.equal(sApp.store.has('sve.notify_banner_dismissed.v1'),false);
+  assert.equal(hApp.context.location.href,'sve://logout');
+
+  // Legacy App (code < 4) must NOT send sve://logout and falls back to /cdn-cgi/access/logout
+  const sLegacy=makeStorage([['sve.notify_banner_dismissed.v1','1']]);
+  const hLegacy=harness('/');
+  hLegacy.context.localStorage=sLegacy.api;
+  hLegacy.context.window.localStorage=sLegacy.api;
+  hLegacy.context.window.__SVE_APP__=true;
+  hLegacy.context.window.__SVE_VER__={name:'1.6',code:3};
+  hLegacy.context.confirm=()=>true;
+  hLegacy.context.fetch=async()=>({json:async()=>({ok:true,auth_mode:'cloudflare',logout_url:'/cdn-cgi/access/logout'})});
+  await hLegacy.elements.get('btnLogout').onclick();
+  assert.equal(sLegacy.store.has('sve.notify_banner_dismissed.v1'),false);
+  assert.equal(hLegacy.context.location.href,'/cdn-cgi/access/logout');
+
+  // Web browser under /test-mount/ calls mounted /api/auth/logout and navigates to /cdn-cgi/access/logout
+  const sWeb=makeStorage([['sve.notify_banner_dismissed.v1','1']]);
+  const hWeb=harness('/test-mount/');
+  hWeb.context.localStorage=sWeb.api;
+  hWeb.context.window.localStorage=sWeb.api;
+  const webPosts=[];
+  hWeb.context.confirm=()=>true;
+  hWeb.context.fetch=async(url,opts)=>{
+    webPosts.push([url,opts?.method||'GET']);
+    return {json:async()=>({ok:true,auth_mode:'cloudflare',logout_url:'/cdn-cgi/access/logout'})};
+  };
+  await hWeb.elements.get('btnLogout').onclick();
+  assert.equal(webPosts.length,1);
+  assert.match(webPosts[0][0],/^\/test-mount\/api\/auth\/logout/);
+  assert.equal(sWeb.store.has('sve.notify_banner_dismissed.v1'),false);
+  assert.equal(hWeb.context.location.href,'/cdn-cgi/access/logout');
+});
+
+test('web browser keeps btnLogin visible when can_login is false and preserves App guidance across refresh',async()=>{
+  const h=harness('/');
+  let currentActive='10001';
+  const calls=[];
+  h.context.fetch=async(url,opts)=>{
+    calls.push([url,opts?.method||'GET']);
+    return {json:async()=>({...state(),active_account_id:currentActive,can_login:false,login:{}})};
+  };
+  h.run('currentPage="events";');
+  await h.run('refresh()');
+  assert.equal(h.elements.get('btnLogin').style.display,'');
+
+  const beforeClicks=calls.length;
+  await h.elements.get('btnLogin').onclick();
+  assert.equal(calls.length,beforeClicks,'web guidance must not call /api/login/intent or /api/login/start');
+  assert.match(h.elements.get('loginBox').innerHTML,/手机 App/);
+
+  // Subsequent 2s refresh() with empty login state preserves the guidance
+  await h.run('refresh()');
+  assert.match(h.elements.get('loginBox').innerHTML,/手机 App/);
+
+  // Switching active account clears the web guidance banner
+  currentActive='10002';
+  h.run('loadTournaments=async()=>{}; loadMyTournaments=async()=>{};');
+  await h.run('refresh()');
+  assert.equal(h.elements.get('loginBox').innerHTML,'');
 });
 
