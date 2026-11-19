@@ -99,8 +99,8 @@ android {
         targetSdk = 34
         // 版本号必须随每次构建递增：Android 靠 versionCode 判断"这是不是更新"，
         // 不变会让覆盖安装的行为不可预期；versionName 则显示给用户看。
-        versionCode = 3
-        versionName = "1.6"
+        versionCode = 4
+        versionName = "1.7"
         buildConfigField("String", "SVE_BASE_URL", "\"\"")
     }
 
