@@ -22,7 +22,18 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <!-- 首次启动与更换服务器配置页 -->
+        <activity
+            android:name=".ServerSetupActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:label="@string/server_setup_title"
+            android:windowSoftInputMode="adjustResize" />
 
         <!-- 新增账号：内嵌 WebView 打开官方登录页，用 CookieManager 读 Cookie -->
         <activity

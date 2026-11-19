@@ -55,6 +55,7 @@ class LoginActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
     private lateinit var status: TextView
+    private var serverBaseUrl: String = ""
 
     private var phase = Phase.LOGIN
     private var pendingCookie: String = ""
@@ -158,10 +159,16 @@ class LoginActivity : AppCompatActivity() {
 
             override fun onPageFinished(v: WebView, url: String) {
                 // 交换阶段：已切到自家域名，同源 fetch 才带得上 Access Cookie
-                if (phase == Phase.EXCHANGE && url.startsWith(Cfg.BASE_URL)) {
+                if (phase == Phase.EXCHANGE && isOnServerOrigin(url)) {
                     postCookie(pendingCookie)
                 }
             }
+        }
+
+        serverBaseUrl = ServerConfig.getBaseUrl(this)
+        if (serverBaseUrl.isEmpty()) {
+            fail(getString(R.string.login_no_server))
+            return
         }
 
         // ── 关键顺序：先清理、再记起点、最后才打开登录页 ──
@@ -188,7 +195,7 @@ class LoginActivity : AppCompatActivity() {
     /**
      * 清掉**网易域**的 Cookie —— 只清它，**绝不碰自家域**。
      *
-     * 为什么不能用 `removeAllCookies()`：那会把我们自家域（[Cfg.BASE_URL]）的
+     * 为什么不能用 `removeAllCookies()`：那会把我们自家域（用户配置的服务器域名）的
      * Cookie 一起清掉，其中包括 **Cloudflare Access 的 `CF_Authorization` JWT**
      * —— 主界面会掉登录，用户得重新过一遍 Access。所以只能按 URL 逐个把
      * Cookie 置为过期（CookieManager 没有"按域删除"的 API）。
@@ -282,14 +289,25 @@ class LoginActivity : AppCompatActivity() {
         return all.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
 
+    private fun isOnServerOrigin(url: String): Boolean {
+        if (serverBaseUrl.isEmpty()) return false
+        return url == serverBaseUrl ||
+            url.startsWith("$serverBaseUrl/") ||
+            url.startsWith("$serverBaseUrl?")
+    }
+
     // ------------------------------------------------------------------ 交换
     private fun startExchange(cookie: String) {
+        if (serverBaseUrl.isEmpty()) {
+            fail(getString(R.string.login_no_server))
+            return
+        }
         phase = Phase.EXCHANGE
         pendingCookie = cookie
         status.text = getString(R.string.login_exchanging)
         // 切到自家域名：Access 的 Cookie 是 App 级共享的，此处已通过认证；
         // 在同源下 fetch 才不会被 CORS/SameSite 拦住。
-        web.loadUrl(Cfg.BASE_URL)
+        web.loadUrl(serverBaseUrl)
     }
 
     /**
@@ -364,8 +382,10 @@ class LoginActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        (web.parent as? ViewGroup)?.removeView(web)
-        web.destroy()
+        if (::web.isInitialized) {
+            (web.parent as? ViewGroup)?.removeView(web)
+            web.destroy()
+        }
         super.onDestroy()
     }
 }

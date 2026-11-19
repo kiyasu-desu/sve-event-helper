@@ -9,9 +9,6 @@ package com.svetool.monitor
  */
 object Cfg {
 
-    /** 服务器 Web UI（Task 5 切换为 ServerConfig 后移除此过渡常量）。 */
-    const val BASE_URL = BuildConfig.SVE_BASE_URL
-
     /** 官方登录页（与电脑端 weblogin.py 用的是同一个地址）。 */
     const val LOGIN_PAGE = "https://login-betasystem.nie.netease.com/ma68/#/pages/index/index"
 
