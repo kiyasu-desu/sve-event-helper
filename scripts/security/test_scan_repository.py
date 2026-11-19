@@ -84,6 +84,9 @@ class GitModesTest(unittest.TestCase):
             ('identity-backups/screenshot.png', [], 'private-file'),
             ('keystore.properties', [], 'private-file'),
             ('android/keystore.properties', [], 'private-file'),
+            ('users-v1.json', [], 'private-file'),
+            ('users/abcdef0123456789abcdef01/notify.json', [], 'private-file'),
+            ('users/abcdef0123456789abcdef01/profile.json', [], 'private-file'),
         ]
         for name, known, category in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='sve-security-test-') as directory:
