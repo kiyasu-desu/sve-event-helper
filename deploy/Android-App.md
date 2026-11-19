@@ -1,7 +1,6 @@
 # Android App —— 在手机上新增网易账号
 
-> 这是一个**极薄的 WebView 外壳**：主界面直接加载服务器上的 Web UI
-> （`https://sve.example.com`），只额外提供一件网页做不到的事——**新增账号**。
+> 这是一个**极薄的 WebView 外壳**：公开版本**不内置任何服务器地址与凭据**，首次启动引导用户输入自己的 HTTPS 服务地址（例如 `https://sve.example.com`），主界面加载服务器上的 Web UI，并额外提供网页做不到的原生能力——**新增账号**。
 
 ---
 
@@ -23,18 +22,24 @@
 ## 二、它是怎么工作的
 
 ```
-┌─ MainActivity ─────────────────────────────────────────┐
-│  WebView → https://sve.example.com                    │
-│  （复用全部现有界面：账号/赛事/订阅/通知设置…）        │
-│  ＋ 一个原生悬浮按钮「新增账号」                        │
+┌─ ServerSetupActivity（首次启动或切换服务器）───────────┐
+│  用户输入并校验 HTTPS origin（禁止明文 HTTP、路径与凭据）
+│  写入应用私有 SharedPreferences，不入仓库与打包产物     │
 └──────────────────────┬─────────────────────────────────┘
-                       │ 点击
+                       │ 进入主界面
+┌─ MainActivity ───────▼─────────────────────────────────┐
+│  WebView → 用户配置的 HTTPS 地址 (如 https://sve.example.com)
+│  （复用全部现有界面：账号/赛事/订阅/通知设置…）        │
+│  支持网页「新增账号」(sve://login)、App 内「更换服务器 │
+│  地址」(sve://server)、桌面长按快捷方式及断网兜底页    │
+└──────────────────────┬─────────────────────────────────┘
+                       │ 点击「新增账号」
 ┌──────────────────────▼─────────────────────────────────┐
 │  LoginActivity                                         │
 │   ① WebView 打开**官方登录页**，用户正常登录           │
 │      （手机号+验证码 / 密码 / 扫码，取决于页面提供）   │
 │   ② 轮询 CookieManager，直到出现会话 Cookie            │
-│   ③ WebView 切到自家域名（Access Cookie 是 App 级共享）│
+│   ③ WebView 切到用户配置的域名（Access Cookie App 级共享）
 │   ④ **同源 fetch** 把 Cookie POST 给 /api/login/cookie │
 └──────────────────────┬─────────────────────────────────┘
                        │
@@ -57,8 +62,8 @@ Cookie 里。原生的 HTTP 客户端（OkHttp 之类）拿不到它，会直接
 **② 为什么第 ③ 步要切到自家域名**
 
 从登录页（`login-betasystem.nie.netease.com`）直接 fetch 我们的 API 属于**跨站请求**：
-CORS 会拦，`SameSite=Lax` 的 Access Cookie 也不会带上。先让 WebView 导航到
-`https://sve.example.com`，再发 fetch 就是**同源**，一切正常。
+CORS 会拦，`SameSite=Lax` 的 Access Cookie 也不会带上。先让 WebView 导航到用户配置的
+HTTPS 服务器地址（如 `https://sve.example.com`），再发 fetch 就是**同源**，一切正常。
 
 ---
 
@@ -70,9 +75,9 @@ CORS 会拦，`SameSite=Lax` 的 Access Cookie 也不会带上。先让 WebView 
 | sessionid | ❌ **不进**。App 不保存会话 |
 | 网易账号密码 | ❌ **不进**。密码只输入到官方登录页，App 不接触 |
 | 网易 Cookie | ⚠️ **仅在内存中搬运一次**，POST 给服务器后即丢弃，不落盘 |
-| 服务器地址 | ✅ 私有构建配置注入（`Cfg.BASE_URL`） |
+| 服务器地址 | ⚙️ **通用版由首次启动用户输入并保存在本机**（公开包 `BuildConfig.SVE_BASE_URL` 为空；仅 `-PsveUsePrivateUrl=true` 的私有 debug 构建可选内置，且严禁用于 release） |
 
-App 是浏览器外壳，WebView 会保存认证 Cookie；丢失设备后应撤销其访问权限。私人 APK 包含服务地址，不上传 GitHub 或 Releases。
+App 是浏览器外壳，WebView 会保存认证 Cookie；丢失设备后应撤销其访问权限。通用签名版 `app-release.apk` 不包含任何私人服务器地址与通知密钥，可公开发布到 GitHub Releases；使用 `-PsveUsePrivateUrl=true` 打出的私有 debug 包仍包含服务地址，绝不能上传 GitHub 或 Releases。
 
 ---
 
@@ -131,38 +136,53 @@ $sdk = 'D:\Android\Sdk'
 sdk.dir=D\:\\Android\\Sdk
 ```
 
-### 私有服务地址（构建必填）
+### 推荐安装方式（普通用户）
 
-复制 `android/private.properties.example` 为 `android/private.properties`，在本机填入**现有生产 HTTPS origin**；也可用环境变量 `SVE_BASE_URL`（优先级更高）。不要把真实地址放进命令行参数、源码、构建日志或 PR。缺失地址、示例域名、带路径/查询/凭据的地址都会使 Gradle 配置失败，避免生成连向示例站点的包。
+普通用户无需搭建 Android 构建环境：直接前往项目 [GitHub Releases](https://github.com/kiyasu-desu/sve-event-helper/releases) 下载通用正式签名版 `app-release.apk`，安装后按引导输入自己的 HTTPS 服务器地址（如 `https://sve.example.com`）即可使用。
 
-示例文件中的 `https://sve.example.com` 仅说明格式，不能直接用于构建。APK 仍然包含注入后的地址，是私人产物。既有 APK、域名、Cloudflare Access 和隧道无需更换；本次没有后端协议变化。
+### 通用 APK 本地构建与 Release 正式签名（维护者）
 
-### 出包
+默认无需 `private.properties` 即可运行调试构建与单元测试：
 
 ```powershell
 $env:JAVA_HOME = '<你的 JDK 路径>'
 $env:ANDROID_HOME = 'D:\Android\Sdk'
 cd sve-monitor\android
-& 'D:\Android\gradle\gradle-8.10.2\bin\gradle.bat' --no-daemon assembleDebug
+& 'D:\Android\gradle\gradle-8.10.2\bin\gradle.bat' --no-daemon testDebugUnitTest assembleDebug
 ```
 
-产物：
+若要打包用于公开发布的正式签名版 `app-release.apk`：
 
-```
-android/app/build/outputs/apk/debug/app-debug.apk
+1. 使用 `keytool` 生成签名密钥库（建议存放在仓库外安全目录），**严禁把 `.jks` / `.keystore` 提交到 Git**。
+2. 复制 `android/keystore.properties.example` 为 `android/keystore.properties`（已被 `.gitignore` 排除）并填写密钥路径、别名与口令；或者设置环境变量 `SVE_KEYSTORE_FILE`、`SVE_KEYSTORE_PASSWORD`、`SVE_KEY_ALIAS`、`SVE_KEY_PASSWORD`。
+3. 执行正式构建（不要传入 `-PsveUsePrivateUrl=true`，Gradle 在 release 任务中也会强制拦截私人地址）：
+
+```powershell
+& 'D:\Android\gradle\gradle-8.10.2\bin\gradle.bat' --no-daemon assembleRelease
 ```
 
-（`*.apk` 与 `build/` 均在 `.gitignore` 内，不会进仓库。）
+产物位于 `android/app/build/outputs/apk/release/app-release.apk`（`*.apk` 与 `build/` 均在 `.gitignore` 内）。
+
+### 可选：私有调试构建（仅限个人 debug 兼容）
+
+如需给个人设备打一个预填地址的调试包，可复制 `android/private.properties.example` 为 `android/private.properties` 填入你的生产 HTTPS origin（或设置 `SVE_BASE_URL`），并在构建 **debug** 时显式传入 `-PsveUsePrivateUrl=true`：
+
+```powershell
+& 'D:\Android\gradle\gradle-8.10.2\bin\gradle.bat' --no-daemon assembleDebug -PsveUsePrivateUrl=true
+```
+
+- 仅当应用尚未保存运行时地址时才回退读取该编译期地址；既有的私人 APK、域名、Cloudflare Access 和隧道无需更换。
+- `release` 与 `build` 等含 Release 的任务会无条件拒绝 `-PsveUsePrivateUrl=true` 并将 `BuildConfig.SVE_BASE_URL` 固定为空串。
 
 ---
 
-## 六、侧载安装
+## 六、安装与首次配置
 
-1. 把 `app-debug.apk` 传到手机（数据线 / 网盘 / `adb install`）
+1. 下载通用正式签名版 `app-release.apk`（或本地构建的 `app-debug.apk`）传到手机
 2. 手机上允许「安装未知来源应用」（首次会提示）
-3. 安装后打开 → 桌面出现「SVE 赛事助手」
+3. 打开「SVE 赛事助手」，在「配置服务器地址」界面输入你的 HTTPS 服务根地址（如 `https://sve.example.com`）并保存；后续如需更换，可在 App 内「设置 → 更换服务器地址」、断网兜底页或长按桌面应用图标快捷方式进入修改
 
-> 用 `adb` 更省事：`adb install -r app-debug.apk`
+> 用 `adb` 更省事：`adb install -r app-release.apk`（不同签名的旧包如需替换需先确认签名一致）
 
 ---
 
@@ -206,17 +226,28 @@ android/
 ├── settings.gradle.kts
 ├── build.gradle.kts
 ├── gradle.properties
-├── .gitignore              # 忽略 build/、*.apk、local.properties、签名材料
+├── keystore.properties.example   # 正式签名配置模板（占位值）
+├── private.properties.example    # 可选私有调试地址模板（占位值）
+├── .gitignore                    # 忽略 build/、*.apk、local.properties、private.properties、签名材料
 └── app/
     ├── build.gradle.kts
-    └── src/main/
-        ├── AndroidManifest.xml
-        ├── java/com/svetool/monitor/
-        │   ├── Cfg.kt            # 地址与 Cookie 名（无任何凭据）
-        │   ├── MainActivity.kt   # WebView 主界面 + 「新增账号」按钮
-        │   └── LoginActivity.kt  # 登录页 + Cookie 读取 + 同源 POST
-        └── res/
-            ├── values/{strings,themes,colors}.xml
-            ├── drawable/ic_launcher_foreground.xml   # 矢量图标，仓库内无二进制图片
-            └── mipmap-anydpi-v26/ic_launcher.xml
+    └── src/
+        ├── main/
+        │   ├── AndroidManifest.xml
+        │   ├── java/com/svetool/monitor/
+        │   │   ├── Cfg.kt                 # 登录页、scheme 与网易 Cookie 名（不含服务地址）
+        │   │   ├── ServerUrlValidator.kt  # HTTPS origin 校验与规范化（纯 Kotlin）
+        │   │   ├── ServerConfig.kt        # 运行时服务器地址持久化
+        │   │   ├── ServerSetupActivity.kt # 首次启动/切换服务器配置页
+        │   │   ├── MainActivity.kt        # WebView 主界面 + 断网兜底 + sve:// 桥接 + 快捷方式入口
+        │   │   ├── LoginGate.kt           # 登录 Cookie 稳定期判定（纯函数）
+        │   │   └── LoginActivity.kt       # 登录页 + Cookie 读取 + 同源 POST
+        │   └── res/
+        │       ├── values/{strings,themes,colors}.xml
+        │       ├── xml/shortcuts.xml               # 桌面长按「更换服务器」快捷方式
+        │       ├── drawable/ic_launcher_foreground.xml   # 矢量图标，仓库内无二进制图片
+        │       └── mipmap-anydpi-v26/ic_launcher.xml
+        └── test/java/com/svetool/monitor/
+            ├── LoginGateTest.kt
+            └── ServerUrlValidatorTest.kt
 ```

@@ -30,6 +30,6 @@ python scripts/security/scan_repository.py --mode history --ref HEAD
 
 ## Android 与抓包配置
 
-Android 从环境变量 `SVE_BASE_URL` 或忽略文件 `android/private.properties` 读取现有 HTTPS origin。示例配置不能直接构建；缺配置明确失败。私人 APK 含地址，不能放在 PR、Releases 或仓库。此改动不修改既有手机应用和服务端协议。
+Android 公开与通用 Release 构建（`assembleRelease`）不包含任何服务器地址或私人凭据，用户首次启动时在应用内填写自己的 HTTPS 地址；通用签名版 `app-release.apk` 可发布至 GitHub Releases。可选的私人 debug 构建（需显式传入 `-PsveUsePrivateUrl=true`，从 `SVE_BASE_URL` 或忽略文件 `android/private.properties` 读取地址）与签名材料（`android/keystore.properties`、`*.jks`、`*.keystore`）不得进入 PR、Releases 或仓库。此改动不破坏既有手机应用、`/api/login/cookie` 与服务端协议。
 
 三个签名探针从 `SVE_SIGNING_SAMPLES_FILE` 或忽略的 `config/signing-samples.json` 读取样本，格式见合成模板。不要把真实请求样本重新写回源码。探针本身会读取私人密钥，不应把其输出当作可公开附件。
