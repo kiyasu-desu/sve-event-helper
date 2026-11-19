@@ -875,8 +875,83 @@ class ServerIsolationTests(unittest.TestCase):
                 self.assertEqual(200, t_resp.status_code)
                 self.assertTrue(t_resp.get_json()["ok"])
 
+    def test_state_exposes_auth_mode_and_logout_clears_session_cookies(self):
+        srv = self.srv
+        friend_hdrs = self.cf_headers("friend@example.com")
 
+        # 1) Cloudflare mode: /api/state exposes user.auth_mode == "cloudflare"
+        cf_state = self.client.get("/api/state", headers=friend_hdrs)
+        self.assertEqual(200, cf_state.status_code)
+        self.assertEqual("cloudflare", cf_state.get_json()["user"]["auth_mode"])
 
+        # Seed cookies + login_intent and call POST /api/auth/logout
+        self.client.set_cookie("sve_account_id", "10001")
+        self.client.set_cookie("sve_login_intent", "tok-123")
+        self.client.set_cookie("CF_Authorization", "jwt-placeholder")
+        with srv.LOCK:
+            srv.STATE["login_intents"]["tok-123"] = {
+                "snapshot": {}, "created": 0.0, "user_id": "friend@example.com",
+            }
+
+        logout_resp = self.client.post("/api/auth/logout", headers=friend_hdrs)
+        self.assertEqual(200, logout_resp.status_code)
+        self.assertEqual(
+            {"ok": True, "auth_mode": "cloudflare", "logout_url": "/cdn-cgi/access/logout"},
+            logout_resp.get_json(),
+        )
+        set_cookies = logout_resp.headers.getlist("Set-Cookie")
+        for cookie_name in ("sve_account_id", "sve_login_intent", "CF_Authorization"):
+            matched = [h for h in set_cookies if h.startswith(f"{cookie_name}=")]
+            self.assertTrue(matched, f"Expected Set-Cookie deletion header for {cookie_name}, got {set_cookies}")
+            self.assertTrue(
+                any("Max-Age=0" in h or "Expires=Thu, 01 Jan 1970" in h for h in matched),
+                f"Expected expiry in Set-Cookie for {cookie_name}: {matched}",
+            )
+            self.assertTrue(any("Path=/" in h for h in matched), f"Expected Path=/ in Set-Cookie for {cookie_name}: {matched}")
+        self.assertNotIn("tok-123", srv.STATE["login_intents"])
+
+        # 2) Single mode: /api/state exposes "single", /api/auth/logout returns logout_url=None and clears cookies
+        with patch.dict(os.environ, {"SVE_AUTH_MODE": "single"}):
+            single_state = self.client.get("/api/state")
+            self.assertEqual(200, single_state.status_code)
+            self.assertEqual("single", single_state.get_json()["user"]["auth_mode"])
+
+            self.client.set_cookie("sve_account_id", "10001")
+            self.client.set_cookie("sve_login_intent", "tok-456")
+            with srv.LOCK:
+                srv.STATE["login_intents"]["tok-456"] = {
+                    "snapshot": {}, "created": 0.0, "user_id": "owner",
+                }
+            single_logout = self.client.post("/api/auth/logout")
+            self.assertEqual(200, single_logout.status_code)
+            self.assertEqual({"ok": True, "auth_mode": "single", "logout_url": None}, single_logout.get_json())
+            single_cookies = single_logout.headers.getlist("Set-Cookie")
+            for cookie_name in ("sve_account_id", "sve_login_intent", "CF_Authorization"):
+                self.assertTrue(any(h.startswith(f"{cookie_name}=") for h in single_cookies))
+            self.assertNotIn("tok-456", srv.STATE["login_intents"])
+
+            # 3) Proxied /api/state overrides user.auth_mode with local _auth_mode() ("single")
+            fake_agent = Mock()
+            fake_agent.accounts_summary.return_value = {
+                "schema_version": 2,
+                "session_write": 2,
+                "accounts": [],
+                "tombstones": {},
+            }
+            fake_agent.endpoint.return_value = {
+                "ok": True,
+                "accounts": [],
+                "user": {"role": "admin", "notify_configured": True, "auth_mode": "cloudflare"},
+            }
+            with patch.dict(srv.STATE, {"remote": {"enabled": True, "host": "node.example.com", "user": "ops"}}), \
+                    patch.object(srv, "ready_login_tunnel"), \
+                    patch.object(srv, "agent", return_value=fake_agent):
+                proxied_state = self.client.get("/api/state")
+                self.assertEqual(200, proxied_state.status_code)
+                proxied_user = proxied_state.get_json()["user"]
+                self.assertEqual("single", proxied_user["auth_mode"])
+                self.assertEqual("admin", proxied_user["role"])
+                self.assertTrue(proxied_user["notify_configured"])
 
 
 if __name__ == "__main__":
