@@ -141,6 +141,7 @@ class MainActivity : AppCompatActivity() {
                             Intent(this@MainActivity, LoginActivity::class.java)
                         )
                         "server" -> launchServerSetup(allowCancel = true)
+                        "logout" -> performLogout()
                     }
                     return true   // 已处理，WebView 不要再去加载它
                 }
@@ -347,6 +348,28 @@ class MainActivity : AppCompatActivity() {
     private fun hideErrorOverlay() {
         if (::errorOverlay.isInitialized) {
             errorOverlay.visibility = View.GONE
+        }
+    }
+
+    private fun performLogout() {
+        hideErrorOverlay()
+        if (::web.isInitialized) {
+            web.stopLoading()
+        }
+        val cookies = CookieManager.getInstance()
+        cookies.removeAllCookies {
+            cookies.flush()
+            runOnUiThread {
+                if (isFinishing || isDestroyed || !::web.isInitialized) return@runOnUiThread
+                pendingHistoryClear = true
+                val target = ServerConfig.getBaseUrl(this@MainActivity).ifEmpty { currentBaseUrl }
+                if (target.isNotEmpty()) {
+                    currentBaseUrl = target
+                    web.loadUrl(target)
+                } else {
+                    launchServerSetup(allowCancel = false)
+                }
+            }
         }
     }
 

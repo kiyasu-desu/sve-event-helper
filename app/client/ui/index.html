@@ -86,6 +86,12 @@
   #pageMenu a { display: block; padding: 12px; margin-bottom: 8px; border-radius: 8px;
                 color: var(--fg); text-decoration: none; }
   #pageMenu a[aria-current="page"] { background: var(--panel2); color: var(--accent); font-weight: 600; }
+  #pageMenu .menu-logout { margin: 0; padding: 10px 12px; min-height: 44px; border-radius: 8px;
+                           background: transparent; border: 1px solid var(--line); color: var(--fg);
+                           font-size: 14px; justify-self: end; }
+  #pageMenu .menu-logout:hover { border-color: var(--err); color: var(--err); }
+  #pageMenu .menu-logout:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  #pageMenu .menu-logout[hidden] { display: none; }
   #pageMenu.inline-nav { display: block; position: static; width: auto; height: auto;
                          border: 0; border-bottom: 1px solid var(--line); }
   #pageMenu.inline-nav nav { display: flex; gap: 8px; min-height: 0; padding: 4px 12px; }
@@ -93,6 +99,7 @@
   #pageMenu.inline-nav .menu-bottom { margin: 0 0 0 auto; padding: 0; }
   #pageMenu.inline-nav .menu-links { display: flex; flex-wrap: wrap; gap: 8px; overflow: visible; }
   #pageMenu.inline-nav a { margin: 0; }
+  #pageMenu.inline-nav .menu-logout { margin: 0; padding: 8px 12px; min-height: 36px; }
   @media (prefers-reduced-motion: no-preference) {
     #pageMenu[open] { animation: open-menu .18s ease-out; }
     @keyframes open-menu { from { transform: translateX(100%); } }
@@ -270,12 +277,13 @@ button.small.act { min-width: 84px; text-align: center; }
     <div class="menu-links">
       <a href="./" data-page="events">赛事列表</a>
       <a href="./subs" data-page="subs">自动报名订阅</a>
+      <a href="./settings" data-page="settings">设置</a>
     </div>
     <div class="menu-bottom">
       <a id="projectGithub" target="_self" rel="noreferrer" aria-label="打开项目 GitHub 仓库" hidden>
         <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M 8 0 C 3.58 0 0 3.58 0 8 c 0 3.54 2.29 6.53 5.47 7.59 .4 .07 .55 -.17 .55 -.38 0 -.19 -.01 -.82 -.01 -1.49 -2.01 .37 -2.53 -.49 -2.69 -.94 -.09 -.23 -.48 -.94 -.82 -1.13 -.28 -.15 -.68 -.52 -.01 -.53 .63 -.01 1.08 .58 1.23 .82 .72 1.21 1.87 .87 2.33 .66 .07 -.52 .28 -.87 .51 -1.07 -1.78 -.2 -3.64 -.89 -3.64 -3.95 0 -.87 .31 -1.59 .82 -2.15 -.08 -.2 -.36 -1.02 .08 -2.12 0 0 .67 -.21 2.2 .82 A 7.65 7.65 0 0 1 8 3.86 c .68 0 1.36 .09 2 .27 1.53 -1.04 2.2 -.82 2.2 -.82 .44 1.1 .16 1.92 .08 2.12 .51 .56 .82 1.27 .82 2.15 0 3.07 -1.87 3.75 -3.65 3.95 .29 .25 .54 .73 .54 1.48 0 1.07 -.01 1.93 -.01 2.2 0 .21 .15 .46 .55 .38 A 8.013 8.013 0 0 0 16 8 c 0 -4.42 -3.58 -8 -8 -8 Z"/></svg>
       </a>
-      <a href="./settings" data-page="settings">设置</a>
+      <button id="btnLogout" type="button" class="menu-logout">退出登录</button>
     </div>
   </nav>
 </dialog>
@@ -292,7 +300,10 @@ button.small.act { min-width: 84px; text-align: center; }
 
 <div id="notifySetupBanner" class="banner info" role="status" hidden style="margin:10px 14px 0;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
   <span>尚未配置消息接收，自动报名成功将无法推送通知。</span>
-  <button id="btnGoNotifySetup" type="button" class="small primary">去配置通知</button>
+  <div class="row" style="gap:8px">
+    <button id="btnGoNotifySetup" type="button" class="small primary">去配置通知</button>
+    <button id="btnDismissNotifyBanner" type="button" class="small" aria-label="关闭通知提示">关闭</button>
+  </div>
 </div>
 
 <main id="eventsPage">
@@ -606,6 +617,7 @@ async function refresh({signal, reloadEventsOnAccountChange = true} = {}) {
     if (LAST_ACTIVE !== undefined && ACCOUNT_ID !== LAST_ACTIVE) {
       LAST_ACTIVE = ACCOUNT_ID;
       ACCOUNT_EPOCH++;
+      webLoginGuidanceVisible = false;
       if (ACCOUNT_ID) {
         clearAccountView("已切换为账号「" + accountLabel(ACCOUNT_ID) + "」，正在按新账号加载赛事列表…");
         if (reloadEventsOnAccountChange && (currentPage === "events" || !currentPage)) loadTournaments();
@@ -625,11 +637,13 @@ async function refresh({signal, reloadEventsOnAccountChange = true} = {}) {
     if (currentPage === "events" || !currentPage) renderAccountList();
 
     // 登录进度
+    CAN_SERVER_LOGIN = s.can_login !== false;
     const lg = s.login || {};
-    if (lg.running) $("loginBox").innerHTML = `<div class="banner info">${esc(lg.message || '正在登录…')}</div>`;
-    else if (lg.ok) $("loginBox").innerHTML = `<div class="banner ok">${esc(lg.message)}</div>`;
-    else if (lg.error) $("loginBox").innerHTML = `<div class="banner err">${esc(lg.error)}</div>`;
-    else if (lg.notice) $("loginBox").innerHTML = `<div class="banner info">${esc(lg.notice)}</div>`;
+    if (lg.running) { webLoginGuidanceVisible = false; $("loginBox").innerHTML = `<div class="banner info">${esc(lg.message || '正在登录…')}</div>`; }
+    else if (lg.ok) { webLoginGuidanceVisible = false; $("loginBox").innerHTML = `<div class="banner ok">${esc(lg.message)}</div>`; }
+    else if (lg.error) { webLoginGuidanceVisible = false; $("loginBox").innerHTML = `<div class="banner err">${esc(lg.error)}</div>`; }
+    else if (lg.notice) { webLoginGuidanceVisible = false; $("loginBox").innerHTML = `<div class="banner info">${esc(lg.notice)}</div>`; }
+    else if (webLoginGuidanceVisible && !inApp() && !CAN_SERVER_LOGIN) $("loginBox").innerHTML = WEB_LOGIN_GUIDANCE_HTML;
     else $("loginBox").innerHTML = "";
 
     // Configuration values remain on the execution side; display status only.
@@ -637,16 +651,8 @@ async function refresh({signal, reloadEventsOnAccountChange = true} = {}) {
     USER_STATE = s.user || {role: "admin", notify_configured: true};
     updateUserRoleAndBanner();
 
-    // 「新增账号」的可见性：分两种环境，不能只看 can_login。
-    //
-    //   App 内（window.__SVE_APP__）→ 走原生通道 sve://login 打开登录页，
-    //                               **不依赖服务器有没有浏览器** → 必须显示。
-    //                               早先只判 can_login，导致服务器无浏览器时
-    //                               按钮在 App 里也被隐藏（实测踩到）。
-    //   浏览器内 → 网页登录要靠本机开真浏览器读 Cookie，才看 can_login。
-    //             缺字段时按"能登录"处理，避免旧后端被误禁用。
-    const canLogin = inApp() || s.can_login !== false;
-    $("btnLogin").style.display = canLogin ? "" : "none";
+    // 「新增账号」按钮在网页端与手机 App 内均常显；无本地浏览器的网页端点击时展示 App 引导提示。
+    $("btnLogin").style.display = "";
     configureAppServerSwitch();
 
     // 合并服务器状态与"仍未确认"的乐观操作：这期间后台轮询不得把刚点下去的
@@ -726,14 +732,51 @@ let MINE = new Set();   // 当前账号已订阅的赛事 id（由 /api/state �
 let MY_TOURS = [];      // 当前账号的「我的赛事」（服务端 mine=1 筛选）
 let REMOTE_ON = false;  // 是否处于「服务器执行」模式
 let USER_STATE = {role: "admin", notify_configured: true};
+let CAN_SERVER_LOGIN = true;
+let webLoginGuidanceVisible = false;
+const NOTIFY_BANNER_DISMISSED_KEY = "sve.notify_banner_dismissed.v1";
+let notifyBannerDismissed = false;
+const WEB_LOGIN_GUIDANCE_HTML =
+  '<div class="banner info">当前为网页端，受浏览器跨域限制无法直接读取网易登录凭据；请打开<b>手机 App</b> 登录当前账号后点击「新增账号」。</div>';
+
+function getLocalStorageSafe() {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage : window.localStorage;
+  } catch (_) {
+    return null;
+  }
+}
+
+function isNotifyBannerDismissed() {
+  if (notifyBannerDismissed) return true;
+  try {
+    const storage = getLocalStorageSafe();
+    if (storage?.getItem?.(NOTIFY_BANNER_DISMISSED_KEY) === "1") {
+      notifyBannerDismissed = true;
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+function setNotifyBannerDismissed(dismissed) {
+  notifyBannerDismissed = Boolean(dismissed);
+  try {
+    const storage = getLocalStorageSafe();
+    if (notifyBannerDismissed) storage?.setItem?.(NOTIFY_BANNER_DISMISSED_KEY, "1");
+    else storage?.removeItem?.(NOTIFY_BANNER_DISMISSED_KEY);
+  } catch (_) {}
+}
 
 function updateUserRoleAndBanner() {
   const remoteSec = $("remoteSection");
   if (remoteSec) remoteSec.hidden = USER_STATE.role !== "admin";
   const banner = $("notifySetupBanner");
   if (banner) {
-    banner.hidden = USER_STATE.notify_configured !== false || currentPage === "settings";
+    banner.hidden = USER_STATE.notify_configured !== false || currentPage === "settings" || isNotifyBannerDismissed();
   }
+  const logoutBtn = $("btnLogout");
+  if (logoutBtn) logoutBtn.hidden = USER_STATE.auth_mode === "single";
 }
 
 $("btnGoNotifySetup").onclick = () => {
@@ -744,6 +787,29 @@ $("btnGoNotifySetup").onclick = () => {
   $("notifyDetails").open = true;
   $("notifyDetails").scrollIntoView?.({behavior: "smooth", block: "nearest"});
 };
+
+$("btnDismissNotifyBanner").onclick = () => {
+  setNotifyBannerDismissed(true);
+  updateUserRoleAndBanner();
+  if (document.activeElement === $("btnDismissNotifyBanner")) {
+    $("appTitle").focus({preventScroll: true});
+  }
+};
+
+async function logoutAccount() {
+  if (!confirm("确认退出当前登录账号？")) return;
+  setNotifyBannerDismissed(false);
+  webLoginGuidanceVisible = false;
+  let res = null;
+  try {
+    res = await api("/api/auth/logout", {method: "POST"});
+  } catch (_) {}
+  if (inApp() && Number(window.__SVE_VER__?.code) >= 4 && nativeCall("logout")) return;
+  const target = res?.logout_url || (USER_STATE.auth_mode === "single" ? "./" : "/cdn-cgi/access/logout");
+  location.href = target;
+}
+
+$("btnLogout").onclick = () => logoutAccount();
 
 // ------------------------------------------------------------------ 通知设置
 const NOTIFY_FIELDS = {
@@ -1573,6 +1639,11 @@ function nativeCall(action) {
 }
 
 async function startLogin(options = {}) {
+  if (!inApp() && !CAN_SERVER_LOGIN) {
+    webLoginGuidanceVisible = true;
+    $("loginBox").innerHTML = WEB_LOGIN_GUIDANCE_HTML;
+    return;
+  }
   // A fresh intent pins versions before opening the official login page. The same
   // WebView cookies also carry it in installed APKs without changing their payload.
   const intent = await api("/api/login/intent", {method:"POST", body:JSON.stringify(options)});

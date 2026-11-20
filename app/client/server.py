@@ -1866,6 +1866,11 @@ def proxy_identity_request():
     if request.path == "/api/state" and result.get("ok") is not False:
         result["login"] = _login_view_for_user()
         result["can_login"] = login_capability()["can_login"]
+        user_view = dict(result.get("user") or {})
+        user_view.setdefault("role", current_user().role)
+        user_view.setdefault("notify_configured", is_notify_configured(current_user().user_id))
+        user_view["auth_mode"] = _auth_mode()
+        result["user"] = user_view
     if request.path == "/api/state":
         result["remote"] = dict(remote_config_view(), agent_ok=result.get("ok") is not False)
         result["log"] = []
@@ -1966,7 +1971,25 @@ def api_state():
                         "deleted_accounts": deleted_accounts,
                         "can_login": login_capability()["can_login"], "login_browser": login_capability()["browser"],
                         "login": _login_view_for_user(u.user_id), "log": [], "remote": remote_view,
-                        "user": {"role": u.role, "notify_configured": is_notify_configured(u.user_id)}})
+                        "user": {"role": u.role, "notify_configured": is_notify_configured(u.user_id),
+                                 "auth_mode": _auth_mode()}})
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    token = request.cookies.get("sve_login_intent")
+    if token:
+        with LOCK:
+            STATE["login_intents"].pop(token, None)
+    mode = _auth_mode()
+    resp = jsonify({
+        "ok": True,
+        "auth_mode": mode,
+        "logout_url": "/cdn-cgi/access/logout" if mode == "cloudflare" else None,
+    })
+    for name in ("sve_account_id", "sve_login_intent", "CF_Authorization"):
+        resp.delete_cookie(name, path="/")
+    return resp
 
 
 def observed_login():

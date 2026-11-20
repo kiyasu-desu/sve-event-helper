@@ -16,7 +16,7 @@
  *  改动界面后**记得把 VERSION 加一**，否则老客户端可能继续用缓存的壳。
  * =================================================================== */
 
-const VERSION = 'sve-v29-multi-user-isolation';
+const VERSION = 'sve-v30-logout-and-ui-polish';
 const SHELL_CACHE = `${VERSION}-shell`;
 const ASSET_CACHE = `${VERSION}-assets`;
 const API_PATH = new URL('./api/', self.registration.scope).pathname;

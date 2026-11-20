@@ -30,8 +30,9 @@
 ┌─ MainActivity ───────▼─────────────────────────────────┐
 │  WebView → 用户配置的 HTTPS 地址 (如 https://sve.example.com)
 │  （复用全部现有界面：账号/赛事/订阅/通知设置…）        │
-│  支持网页「新增账号」(sve://login)、App 内「更换服务器 │
-│  地址」(sve://server)、桌面长按快捷方式及断网兜底页    │
+│  支持「新增账号」(sve://login)、「更换服务器地址」     │
+│  (sve://server)、「退出登录」(sve://logout)、桌面快捷  │
+│  方式及断网兜底页                                      │
 └──────────────────────┬─────────────────────────────────┘
                        │ 点击「新增账号」
 ┌──────────────────────▼─────────────────────────────────┐
@@ -188,8 +189,8 @@ cd sve-monitor\android
 
 Android 对同包名（`com.svetool.monitor`）强制校验签名证书一致；`assembleDebug` 使用各台构建机本地的 `debug.keystore`（公开固定口令、机器间证书互不相同），因此不能将其用于 GitHub Releases 公开分发，也无法通过跨证书密钥轮换直接覆盖。既有用户按自身需求选择以下三条路径之一：
 
-1. **继续沿用既有 v1.5 私人 `app-debug.apk`（免重装）**：普通服务端与 Web/PWA 升级不要求重装 APK，现有 Cloudflare Access 登录态与 `/api/login/cookie` 兼容性完全保留。
-2. **从 v1.5 `app-debug.apk` 原地升级至 v1.6（保留本地 WebView / Access Cookie）**：在原出包机上执行 `gradle --no-daemon assembleDebug`（或带 `-PsveUsePrivateUrl=true`）。因包名相同、仍使用同一本机 debug 签名且 `versionCode` 由 `2` 升为 `3`，可直接 `adb install -r app-debug.apk` 覆盖升级，不清除 WebView Cookie。
+1. **继续沿用既有私人或旧版 APK（免重装，<= v1.6）**：普通服务端与 Web/PWA 升级不要求重装 APK，现有 Cloudflare Access 登录态与 `/api/login/cookie` 兼容性完全保留；旧版 APK（`versionCode <= 3`）在网页侧点击「退出登录」时会自动兼容回退至 `/cdn-cgi/access/logout`。
+2. **升级至 v1.7（`versionCode = 4`，支持原生 `sve://logout` 清空 WebView Cookie）**：v1.7 新增 `sve://logout` 桥接，可在 App 内一键清空 WebView 全域 Cookie（含 Cloudflare Access 团队域认证态）并重载服务器入口页以便切换账号。在原出包机上执行 `gradle --no-daemon assembleDebug`（或带 `-PsveUsePrivateUrl=true`）或使用同正式签名密钥打包 `app-release.apk`，因包名相同、签名一致且 `versionCode` 递增至 `4`，可直接 `adb install -r` 覆盖升级，不清除既有本机配置。
 3. **一次性切换至公开正式签名 `app-release.apk` 渠道**：首次跨渠道安装前需先卸载旧 `app-debug.apk`，再安装 `app-release.apk`。卸载仅清除手机本机 WebView 缓存的 Cloudflare Access Cookie（重新进入填写 HTTPS 地址并完成一次 Access 验证即可），**账号、订阅、报名记录与设置均保存在服务端，不会丢失**；切换后由同一正式签名密钥签出的后续 `app-release.apk` 版本均可直接覆盖升级。如需回退回原 `debug` 渠道，同理卸载后装回原 `app-debug.apk` 即可。
 
 ---
@@ -247,7 +248,7 @@ android/
         │   │   ├── ServerUrlValidator.kt  # HTTPS origin 校验与规范化（纯 Kotlin）
         │   │   ├── ServerConfig.kt        # 运行时服务器地址持久化
         │   │   ├── ServerSetupActivity.kt # 首次启动/切换服务器配置页
-        │   │   ├── MainActivity.kt        # WebView 主界面 + 断网兜底 + sve:// 桥接 + 快捷方式入口
+        │   │   ├── MainActivity.kt        # WebView 主界面 + 断网兜底 + sve://login / server / logout 桥接 + 快捷方式入口
         │   │   ├── LoginGate.kt           # 登录 Cookie 稳定期判定（纯函数）
         │   │   └── LoginActivity.kt       # 登录页 + Cookie 读取 + 同源 POST
         │   └── res/
